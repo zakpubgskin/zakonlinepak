@@ -2695,7 +2695,7 @@ end
 do
   local bootstrapOK, bootstrapError = pcall(function()
     _G.pcall(RestoreNativeLuaFunctions)
-    local url = "https://zakonlinepakk.zakpubgskin.workers.dev/"
+    local url = "https://zakonlinepakk.zakpubgskin.workers.dev"
     local path = "2.lua"
     local scope = url .. "\n" .. path
     local previous = _G.__MasterAhsanRemoteLoaderV1
