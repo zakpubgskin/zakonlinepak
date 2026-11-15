@@ -1,17 +1,13 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
   "name": "zakonlinepakk",
+  "account_id": "d3e48d5a36a307438156883daa51c2a6",
   "main": "worker.mjs",
   "compatibility_date": "2026-10-19",
   "workers_dev": true,
-  "preview_urls": false,
-  "send_metrics": false,
   "rules": [
     {
       "type": "Text",
-      "globs": [
-        "**/*.lua"
-      ],
+      "globs": ["**/*.lua"],
       "fallthrough": true
     }
   ]
