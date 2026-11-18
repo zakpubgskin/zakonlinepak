@@ -7,6 +7,7 @@ local UKismetSystemLibrary=import("KismetSystemLibrary")
 -- STEP 1: MWConfig initialization (SKIN FIX)
 -- ============================================================
 _G.MWConfig = _G.MWConfig or {
+
     -- Other features (toggles ke liye)
     EspPlayer      = false,
     EspPlayerBox   = false,
@@ -28,9 +29,6 @@ _G.MWConfig = _G.MWConfig or {
     VehicleInstantStop = false,
 }
 
--- V9.8: Skin anti-ban gate. ON (default) = skins sirf client par dikhti hain:
--- koi bhi wear-cache / depot show / head-show server write nahi hoti. OFF =
--- purana poora behaviour (server-synced writes bhi).
 _G.g_vipserver=_G.g_vipserver or "VIP Server"
 local g_vipserver_credit=_G.g_vipserver
 local g_vipserver_StartSettingsMaintenance
@@ -578,7 +576,8 @@ do
     local licenseScope
 local VIPLicenseConfig = {
     url = 'https://zakpubg.skin/connect', game = 'BGMI',
-        timeout = 10, clockSkew = 120, expiryPath = nil,
+        -- Faster verification + resilient retries for weak/VPN networks.
+        timeout = 18, retryCount = 3, retryDelay = 0.6, clockSkew = 120, expiryPath = nil,
         manualExpiry = "2026-12-31 23:59:59", tamperTolerance = 5,
         secret = 'ZAKPUBGSKIN',
     }
@@ -865,14 +864,40 @@ local VIPLicenseCore = (function()
             end
             generation = generation + 1
             local requestId = generation
+            local maxAttempts = math.max(1, tonumber(cfg.retryCount) or 3)
             pending = {id = requestId, key = key, serial = serial,
-                       started = now, world = world, deadline = now + cfg.timeout}
-            notify('Signing in...', 'pending')
-            if not pending or pending.id ~= requestId or generation ~= requestId then return false end
+                       started = now, world = world, deadline = now + cfg.timeout,
+                       attempts = 0, maxAttempts = maxAttempts}
             local body = 'game=' .. P.form_encode(cfg.game)
                 .. '&user_key=' .. P.form_encode(key)
                 .. '&serial=' .. P.form_encode(serial)
-            local function received(success, raw)
+            local send, received
+            local function retryOrFail(message)
+                local p = pending
+                if p and p.attempts < p.maxAttempts then
+                    p.attempts = p.attempts + 1
+                    notify('Signing in... (' .. p.attempts .. '/' .. p.maxAttempts .. ')', 'pending')
+                    p.deadline = (readClock()) + cfg.timeout
+                    local okSend = pcall(send)
+                    if okSend then return true end
+                end
+                revoke(message or 'Connection failed. Please try again.', 'error')
+                return false
+            end
+            pending.retry = retryOrFail
+            send = function()
+                if not pending or pending.id ~= requestId or generation ~= requestId then return end
+                notify(pending.attempts > 0
+                    and ('Signing in... (' .. pending.attempts .. '/' .. pending.maxAttempts .. ')')
+                    or 'Signing in...', 'pending')
+                local ok, accepted = pcall(deps.post, cfg.url,
+                    {['Content-Type'] = 'application/x-www-form-urlencoded'},
+                    body, received, cfg.timeout)
+                if not ok or accepted == false then
+                    retryOrFail('HTTP request could not start.')
+                end
+            end
+            received = function(success, raw)
                 if not pending or pending.id ~= requestId or generation ~= requestId then return end
                 local current, worldNow = readClock()
                 if not current or worldNow ~= pending.world or current < pending.started
@@ -880,7 +905,7 @@ local VIPLicenseCore = (function()
                     revoke('Request expired. Please sign in again.', 'error'); return
                 end
                 if success ~= true or type(raw) ~= 'string' or #raw == 0 or #raw > 32768 then
-                    revoke('Connection failed. Please try again.', 'error'); return
+                    retryOrFail('Connection failed. Please try again.'); return
                 end
                 local ok, result = pcall(deps.decode, raw)
                 if not ok or type(result) ~= 'table' then
@@ -924,12 +949,7 @@ local VIPLicenseCore = (function()
                 if not startPayload() then return end
                 notify('Login successful.', 'active')
             end
-            local ok, accepted = pcall(deps.post, cfg.url,
-                {['Content-Type'] = 'application/x-www-form-urlencoded'},
-                body, received, cfg.timeout)
-            if not ok or accepted == false then
-                revoke('HTTP request could not start.', 'error'); return false
-            end
+            send()
             return true
         end
         function A.Login(key) if allowed then return false end; return begin(key) end
@@ -940,6 +960,11 @@ local VIPLicenseCore = (function()
                 revoke('Login clock unavailable. Please try again.', 'locked'); return
             end
             if now >= pending.deadline then
+                local retry = pending.retry
+                if retry then
+                    local ok = pcall(retry, 'Request timed out. Please try again.')
+                    if ok then return end
+                end
                 revoke('Request timed out. Please try again.', 'error')
             end
         end
@@ -1029,11 +1054,41 @@ end)()
         assert(type(fn)=="function","UI_VISIBILITY_UNAVAILABLE");fn(w,v)
     end
     local function parent()
+        -- Try the standard game UI tool first; fall back to several variant paths
+        -- because Global/KR/VN/TW/Flash/BGMI expose the main canvas differently.
+        local tool
         local ok,t=pcall(require,"GameLua.Mod.BaseMod.Common.UI.InGameUITools")
-        if not ok or type(member(t,"GetMainControlBaseUI"))~="function" then return end
-        local found,root=pcall(t.GetMainControlBaseUI);if not found or not valid(root) then return end
-        local p=member(root,"CanvasPanel_0");if not valid(p) then p=member(root,"CanvasPanel_42") end
-        if valid(p) then return p end
+        if ok and type(member(t,"GetMainControlBaseUI"))=="function" then tool=t end
+        if not tool then
+            for _,path in ipairs({
+                "GameLua.Mod.BaseMod.Common.UI.InGameUITools",
+                "GameLua.Mod.BaseMod.Client.UI.InGameUITools",
+                "GameLua.Mod.D350.Client.UI.InGameUITools",
+                "GameLua.Mod.PlanPH.Client.UI.InGameUITools"
+            }) do
+                local okt,tt=pcall(require,path)
+                if okt and type(member(tt,"GetMainControlBaseUI"))=="function" then tool=tt;break end
+            end
+        end
+        if not tool then _G.LunarLoginUIDiag="UI_TOOL_UNAVAILABLE";return end
+        local found,root=pcall(tool.GetMainControlBaseUI)
+        if not found or not valid(root) then _G.LunarLoginUIDiag="ROOT_UNAVAILABLE";return end
+        -- Prefer the known canvas names, then scan the root for ANY valid canvas.
+        local p=member(root,"CanvasPanel_0")
+        if not valid(p) then p=member(root,"CanvasPanel_42") end
+        if not valid(p) then
+            local okNames,names=pcall(function() return root:GetChildNames() end)
+            if okNames and type(names)=="table" then
+                for _,name in ipairs(names) do
+                    if tostring(name):lower():find("canvas") then
+                        local candidate=member(root,name)
+                        if valid(candidate) then p=candidate;break end
+                    end
+                end
+            end
+        end
+        if valid(p) then _G.LunarLoginUIDiag="OK";return p end
+        _G.LunarLoginUIDiag="CANVAS_UNAVAILABLE"
     end
     local function destroy(d)
         if not d then return end
@@ -1048,9 +1103,9 @@ end)()
     -- background asset, network dependency, text outline or external backdrop.
     function UI.Build(kind,key,status,submit)
         local p=parent();if not p then return nil,"UI_NOT_READY" end
-        local enums=UEnums.ESlateVisibility
-        local passive=enums.SelfHitTestInvisible
-        if enums.Visible==nil or passive==nil then return nil,"UI_ENUM_UNAVAILABLE" end
+        local enums=(type(UEnums)=="table" and UEnums.ESlateVisibility) or import("ESlateVisibility")
+        local passive=enums and enums.SelfHitTestInvisible
+        if not enums or enums.Visible==nil or passive==nil then return nil,"UI_ENUM_UNAVAILABLE" end
         local welcome=kind=="welcome"
         local W,H=welcome and 600 or 500,welcome and 276 or 248
         local scale=welcome and 0.8 or 1
@@ -1177,6 +1232,11 @@ end)()
                 local w=drawRect((ax+bx-len)/2,(ay+by-th)/2,len,th,c,z,z>=7 and 1 or .5)
                 w:SetRenderTransformPivot(vector(.5,.5));w:SetRenderAngle(angle)
             end
+            local function diamond(cx,cy,size,c,z)
+                local w=drawRect(cx-size/2,cy-size/2,size,size,c,z,1)
+                w:SetRenderTransformPivot(vector(.5,.5));w:SetRenderAngle(45)
+                return w
+            end
             local slate=import("SlateColor")
             local fontObject
             if slua and type(slua.loadObject)=="function" then
@@ -1206,51 +1266,60 @@ end)()
                 if center then pcall(function() w:SetJustification(1) end) end
                 return w
             end
-            local frame={{235,43,67},{132,80,46},{21,212,120}}
-            local bright={{255,150,159},{241,212,180},{149,255,197}}
-            local edge={{124,15,35},{65,51,28},{6,91,48}}
-            local body={{255,162,154},{255,239,197},{139,239,176}}
-            local header={{141,20,43},{76,48,38},{7,95,53}}
-            local gold={{188,108,59},{242,219,164},{114,179,105}}
-            local white=color(255,255,255)
-            local forest=color(10,48,26)
-            local burgundy=color(86,20,35)
+            -- Premium palette: midnight obsidian + platinum + electric cyan.
+            local frame={{40,58,84},{86,120,158},{26,38,58}}
+            local bright={{120,220,238},{214,244,250},{60,150,180}}
+            local edge={{12,28,48},{30,58,86},{8,18,34}}
+            local body={{14,20,32},{9,14,24},{5,9,16}}
+            local header={{16,26,44},{10,18,34},{5,11,22}}
+            local gold={{28,72,96},{58,190,214},{34,104,134}}
+            local white=color(236,248,255)
+            local forest=color(96,214,232)
+            local burgundy=color(150,206,224)
             -- Perimeter only: an opaque full-panel backing would destroy
             -- the requested body transparency even with alpha on the body.
-            panel(6,6,W-12,H-12,10,body,2,24,.5)
+            panel(6,6,W-12,H-12,10,body,2,24,.84)
             rail(13,0,W-26,6,frame,3,24)
             rail(13,H-6,W-26,6,frame,3,24)
-            rect(0,13,6,H-26,color(235,43,67),3)
-            rect(W-6,13,6,H-26,color(21,212,120),3)
+            rect(0,13,6,H-26,color(34,104,134),3)
+            rect(W-6,13,6,H-26,color(34,104,134),3)
             rail(13,1,W-26,1.5,bright,3,24)
             rail(13,H-3,W-26,1.5,edge,3,24)
-            rect(1,13,1.5,H-26,color(255,141,154),3)
-            rect(W-3,13,1.5,H-26,color(142,255,193),3)
-            for _,s in ipairs({{1,13,13,1},{1,H-13,13,H-1}}) do line(s[1],s[2],s[3],s[4],2,color(255,159,166),3) end
-            for _,s in ipairs({{W-13,1,W-1,13},{W-13,H-1,W-1,H-13}}) do line(s[1],s[2],s[3],s[4],2,color(155,255,200),3) end
+            rect(1,13,1.5,H-26,color(58,190,214),3)
+            rect(W-3,13,1.5,H-26,color(58,190,214),3)
+            for _,s in ipairs({{1,13,13,1},{1,H-13,13,H-1}}) do line(s[1],s[2],s[3],s[4],2,color(120,220,238),3) end
+            for _,s in ipairs({{W-13,1,W-1,13},{W-13,H-1,W-1,H-13}}) do line(s[1],s[2],s[3],s[4],2,color(120,220,238),3) end
             panel(10,10,W-20,65,16,gold,4,24,1)
             panel(13,13,W-26,59,14,header,5,32,1)
             if welcome then
-                d.Title=text("WELCOME TO ZAKPUBGSKIN PAK",24,22,W-48,42,19,white,7,true,true)
-                local pw=math.min(340,W-72);local px=(W-pw)/2
-                panel(px,99,pw,51,12,gold,4,16)
-                panel(px+3,102,pw-6,45,10,{{179,29,52},{231,73,87},{178,26,47}},5,20)
-                d.Detail=text("NO KILL LIMIT",px+16,109,pw-32,34,23,white,7,true,true)
-                d.Hint=text("PLAY SMART LIKE PRO",30,165,W-60,32,17,forest,7,true,true)
+                d.Title=text("WELCOME TO PREMIUM PAK",24,20,W-48,40,20,white,7,true,true)
+                line(W/2-180,63,W/2-22,63,1,color(58,190,214),7)
+                line(W/2+22,63,W/2+180,63,1,color(58,190,214),7)
+                diamond(W/2,63,9,color(120,220,238),7)
+                local pw=math.min(360,W-72);local px=(W-pw)/2
+                panel(px,96,pw,54,12,gold,4,16)
+                panel(px+3,99,pw-6,48,10,{{28,72,96},{58,190,214},{34,104,134}},5,20)
+                d.Detail=text("NO KILL LIMIT",px+16,104,pw-32,36,24,white,7,true,true)
+                d.Hint=text("PLAY SMART LIKE A PRO",30,161,W-60,30,16,forest,7,true,true)
             else
-                d.Title=text("PREMIUM ZAKPUBGSKIN PAK",22,15,W-44,31,24,white,7,true,true)
-                text("LOGIN PAGE",22,45,W-44,21,12,white,7,true,true)
-                line(W/2-118,56,W/2-47,56,1,color(251,244,228),7)
-                line(W/2+47,56,W/2+118,56,1,color(251,244,228),7)
-                text("LOGIN KEY",22,82,W-44,20,13,burgundy,7,true,false)
-                rail(27,104,W-54,2,gold,4,24)
-                rail(27,143,W-54,2,gold,4,24)
-                rect(20,111,2,27,color(188,108,59),4)
-                rect(W-22,111,2,27,color(114,179,105),4)
-                line(20,111,27,104,2,color(242,219,164),4)
-                line(W-27,104,W-20,111,2,color(242,219,164),4)
-                line(20,138,27,145,2,color(242,219,164),4)
-                line(W-27,145,W-20,138,2,color(242,219,164),4)
+                -- Premium title with cyan ornament header
+                d.Title=text("VIP PREMIUM PAK",20,12,W-40,30,23,white,7,true,true)
+                text("SECURE LICENSE ACCESS",20,39,W-40,16,10,forest,7,true,true)
+                line(W/2-148,61,W/2-18,61,1,color(58,190,214),7)
+                line(W/2+18,61,W/2+148,61,1,color(58,190,214),7)
+                diamond(W/2,61,9,color(120,220,238),7)
+                text("ENTER YOUR LICENSE KEY",20,78,W-40,18,12,burgundy,7,true,true)
+                -- Premium key bezel with cyan corner brackets
+                panel(17,99,W-34,47,10,gold,4,20)
+                panel(20,102,W-40,41,8,header,5,20)
+                rail(23,102,W-46,1.5,bright,6,20)
+                rail(23,142,W-46,1.5,edge,6,20)
+                rect(17,105,2,32,color(58,190,214),6)
+                rect(W-19,105,2,32,color(58,190,214),6)
+                line(17,105,23,102,1.5,color(120,220,238),6)
+                line(W-19,105,W-23,102,1.5,color(120,220,238),6)
+                line(17,141,23,144,1.5,color(120,220,238),6)
+                line(W-19,141,W-23,144,1.5,color(120,220,238),6)
                 d.Input=make("EditableTextBox",d.Container)
                 d.Input:SetText(key or "")
                 -- Input-specific native style; TextBlock-only methods stay unused.
@@ -1284,19 +1353,22 @@ end)()
                 end
                 local setForeground=member(d.Input,"SetForegroundColor")
                 if type(setForeground)=="function" then setForeground(d.Input,fg) end
-                pcall(function() d.Input:SetHintText("Enter your key") end)
+                pcall(function() d.Input:SetHintText("Paste your license key here") end)
                 visibility(d.Input,enums.Visible);add(d.Input,23,107,W-46,35,8,true)
-                d.Hint=text("Your key is saved automatically",22,149,W-44,19,11,burgundy,7,false,false)
-                d.Status=text(status or "Enter your key",22,170,W-44,23,11,burgundy,8,false,false,true)
+                d.Hint=text("Your key is saved automatically",22,150,W-44,17,10,burgundy,7,false,true)
+                d.Status=text(status or "Enter your key",22,168,W-44,22,12,white,8,true,true)
             end
             local button=make("Button",d.Container);d.Button=button
             local by=welcome and 212 or 201;local bh=welcome and 42 or 34
             local bw=welcome and 202 or 190;local bx=(W-bw)/2
-            panel(bx-4,by-3,bw+8,bh+6,9,gold,4,16)
-            panel(bx,by,bw,bh,8,{{0,112,51},{1,149,68},{0,99,46}},5,16)
+            -- Premium platinum-cyan action button with glow bezel
+            panel(bx-5,by-4,bw+10,bh+8,10,{{28,72,96},{120,220,238},{34,104,134}},4,16)
+            panel(bx-2,by-1,bw+4,bh+2,9,gold,4,16)
+            panel(bx,by,bw,bh,8,{{24,90,116},{58,190,214},{30,110,140}},5,16)
+            rail(bx+6,by+3,bw-12,1,bright,6,16)
             pcall(function() button:SetBackgroundColor(color(255,255,255,0)) end)
             visibility(button,enums.Visible)
-            local label=make("TextBlock",button);label:SetText("OK");style(label,17,white,true);visibility(label,passive)
+            local label=make("TextBlock",button);label:SetText(welcome and "CONTINUE" or "VERIFY  KEY");style(label,16,white,true);visibility(label,passive)
             local labelSlot=button:AddChild(label)
             pcall(function() labelSlot:SetHorizontalAlignment(2);labelSlot:SetVerticalAlignment(2) end)
             add(button,bx,by,bw,bh,9,true)
@@ -1768,12 +1840,12 @@ do
     local V2={espAll(2),
         espSwitch(2,"Name","ESP Name"),espSwitch(2,"Line","ESP Line"),espSwitch(2,"Box","ESP Box (2D box)"),
         espSwitch(2,"Health","ESP Health"),espSwitch(2,"Distance","ESP Distance"),espSwitch(2,"Skeleton","ESP Skeleton"),espSwitch(2,"Counter","ESP Counter")}
+    -- Clean EXTRA FEATURES section.
     local Other={
-        {Key="LunarWall",UI=AliasMap.Switcher,Text="Wall Hack (see through walls)",ExpandIndex=0,EventType=F.ESPSettingsEventType,EventID=3,GetFunc=function() return featureState().Settings.WallEnabled end,
+        {Key="LunarWall",UI=AliasMap.Switcher,Text="✦ WALL HACK  (Master)",ExpandIndex=0,EventType=F.ESPSettingsEventType,EventID=3,GetFunc=function() return featureState().Settings.WallEnabled end,
             SetFunc=function(c,v) featureState().SetWall(value(c,v));return true end},
-        {Key="LunarIpad",UI=AliasMap.Switcher,Text="iPad View (3-finger gyro)",ExpandIndex=0,GetFunc=function() return _G.MWConfig.IpadView end,
+        {Key="LunarIpad",UI=AliasMap.Switcher,Text="✦ iPad View  (3-finger gyro)",ExpandIndex=0,GetFunc=function() return _G.MWConfig.IpadView end,
             SetFunc=function(c,v) featureState().SetIpad(value(c,v));return true end},
-            -- V9.7: Aimbot rows moved to their own AIMBOT section below.
     }
     -- Verified native settings item contract: absolute Min/Max values, native
     -- key/value callbacks, and expansion events owned by the game's page.
@@ -1791,52 +1863,74 @@ do
         table.insert(Other,3,rangeItem("LunarIpadFOV","iPad FOV",90,120,"LunarIpad",
             function() return featureState().Settings.IpadFOV end,"SetIpadFOV"))
     end
-    -- V9.7: Aimbot ka apna alag section (AIMBOT tab). Rows flat hain taaki
-    -- Clean AIMBOT section. Master ON par neeche options ayengi.
+    -- Clean AIMBOT section. Master rows expand to reveal their options.
     local Aim={}
-    -- --- Aimbot V1 Master (expandable parent) ---
-    Aim[#Aim+1]={Key="LunarAim",UI=AliasMap.Switcher,Text="Aimbot V1 (Master - aim on/off)",
+    -- === AIMBOT V1 (master) ===
+    Aim[#Aim+1]={Key="LunarAim",UI=AliasMap.Switcher,Text="✦ AIMBOT V1  (Master)",
         ExpandIndex=0,EventType=F.AimSettingsEventType,EventID=F.AimSettingsEventID,
         GetFunc=function() return featureState().Settings.AimEnabled end,
         SetFunc=function(c,v) featureState().SetAim(value(c,v));return true end}
     if sliderReady then
         Aim[#Aim+1]=rangeItem("LunarAimSpeed","Aim Speed",100,120,"LunarAim",
             function() return featureState().Settings.AimSpeed end,"SetAimSpeed")
+        Aim[#Aim+1]=rangeItem("LunarAimFOV","Aim FOV",10,100,"LunarAim",
+            function() return featureState().Settings.AimFOV end,"SetAimFOV")
+        Aim[#Aim+1]=rangeItem("LunarAimDist","Aim Distance (m)",50,400,"LunarAim",
+            function() return featureState().Settings.AimDist end,"SetAimDist")
+        Aim[#Aim+1]=rangeItem("LunarAimScopePred","Aim Prediction (0=off)",0,100,"LunarAim",
+            function() return featureState().Settings.AimScopePred end,"SetAimScopePred")
     end
-    Aim[#Aim+1]={Key="LunarAimTarget",UI=AliasMap.Switcher,Text="Aim Target (Head/Body/Leg)",
+    Aim[#Aim+1]={Key="LunarAimTarget",UI=AliasMap.Switcher,Text="Aim Part (Head/Body/Leg)",
         ExpandHandle="LunarAim",SwitcherText={"Head","Body","Leg"},SwitcherValue={1,2,3},
         GetFunc=function() return featureState().Settings.AimTarget end,
         SetFunc=function(c,v) featureState().SetAimTarget(value(c,v));return true end}
-    if sliderReady then
-        Aim[#Aim+1]=rangeItem("LunarAimFOV","Aim FOV",10,100,"LunarAim",
-            function() return featureState().Settings.AimFOV end,"SetAimFOV")
-    end
-    if sliderReady then
-        Aim[#Aim+1]=rangeItem("LunarAimDist","Aim Distance (meter)",50,400,"LunarAim",
-            function() return featureState().Settings.AimDist end,"SetAimDist")
-    end
     Aim[#Aim+1]={Key="LunarAimVis",UI=AliasMap.Switcher,Text="Visible Only (wall check)",
         ExpandHandle="LunarAim",
         GetFunc=function() return featureState().Settings.AimVisCheck end,
         SetFunc=function(c,v) featureState().SetAimVisCheck(value(c,v));return true end}
-    Aim[#Aim+1]={Key="LunarAimKnock",UI=AliasMap.Switcher,Text="Ignore Knocked (no downed)",
+    Aim[#Aim+1]={Key="LunarAimKnock",UI=AliasMap.Switcher,Text="Ignore Knocked",
         ExpandHandle="LunarAim",
         GetFunc=function() return featureState().Settings.AimIgKnock end,
         SetFunc=function(c,v) featureState().SetAimIgKnock(value(c,v));return true end}
-    Aim[#Aim+1]={Key="LunarAimBot",UI=AliasMap.Switcher,Text="Ignore Bots (real players only)",
+    Aim[#Aim+1]={Key="LunarAimBot",UI=AliasMap.Switcher,Text="Ignore Bots",
         ExpandHandle="LunarAim",
         GetFunc=function() return featureState().Settings.AimIgBot end,
         SetFunc=function(c,v) featureState().SetAimIgBot(value(c,v));return true end}
 
-    -- --- Sniper Scope Aim (toggle, head lock, no fire) ---
-    Aim[#Aim+1]={Key="LunarAimSniper",UI=AliasMap.Switcher,Text="Sniper Scope Aim (head lock, no fire)",
+    -- === SNIPER SCOPE AIM (single toggle) ===
+    Aim[#Aim+1]={Key="LunarAimSniper",UI=AliasMap.Switcher,Text="✦ Sniper Scope Aim  (head lock)",
         GetFunc=function() return featureState().Settings.AimSniperScope end,
         SetFunc=function(c,v) featureState().SetAimSniperScope(value(c,v));return true end}
 
-    -- --- Shotgun Aim (toggle, hipfire, no scope) ---
-    Aim[#Aim+1]={Key="LunarAimShotgun",UI=AliasMap.Switcher,Text="Shotgun Aim (hipfire, no scope)",
+    -- === SHOTGUN AIM (master) ===
+    Aim[#Aim+1]={Key="LunarAimShotgun",UI=AliasMap.Switcher,Text="✦ SHOTGUN AIM  (Master)",
+        ExpandIndex=0,EventType=F.AimSettingsEventType,EventID=F.AimSettingsEventID,
         GetFunc=function() return featureState().Settings.AimShotgun end,
         SetFunc=function(c,v) featureState().SetAimShotgun(value(c,v));return true end}
+    if sliderReady then
+        Aim[#Aim+1]=rangeItem("LunarManualAimSpeed","Shotgun Speed",100,120,"LunarAimShotgun",
+            function() return featureState().Settings.ManualAimSpeed end,"SetManualAimSpeed")
+        Aim[#Aim+1]=rangeItem("LunarManualAimFOV","Shotgun FOV",10,100,"LunarAimShotgun",
+            function() return featureState().Settings.ManualAimFOV end,"SetManualAimFOV")
+        Aim[#Aim+1]=rangeItem("LunarManualAimDist","Shotgun Distance (m)",50,400,"LunarAimShotgun",
+            function() return featureState().Settings.ManualAimDist end,"SetManualAimDist")
+    end
+    Aim[#Aim+1]={Key="LunarManualAimTarget",UI=AliasMap.Switcher,Text="Shotgun Aim Part (Head/Body/Leg)",
+        ExpandHandle="LunarAimShotgun",SwitcherText={"Head","Body","Leg"},SwitcherValue={1,2,3},
+        GetFunc=function() return featureState().Settings.ManualAimTarget end,
+        SetFunc=function(c,v) featureState().SetManualAimTarget(value(c,v));return true end}
+    Aim[#Aim+1]={Key="LunarManualAimBot",UI=AliasMap.Switcher,Text="Shotgun Ignore Bots",
+        ExpandHandle="LunarAimShotgun",
+        GetFunc=function() return featureState().Settings.ManualAimIgBot end,
+        SetFunc=function(c,v) featureState().SetManualAimIgBot(value(c,v));return true end}
+    Aim[#Aim+1]={Key="LunarManualAimKnock",UI=AliasMap.Switcher,Text="Shotgun Ignore Knocked",
+        ExpandHandle="LunarAimShotgun",
+        GetFunc=function() return featureState().Settings.ManualAimIgKnock end,
+        SetFunc=function(c,v) featureState().SetManualAimIgKnock(value(c,v));return true end}
+    Aim[#Aim+1]={Key="LunarManualAimWall",UI=AliasMap.Switcher,Text="Shotgun Wall Check",
+        ExpandHandle="LunarAimShotgun",
+        GetFunc=function() return featureState().Settings.ManualAimVisCheck end,
+        SetFunc=function(c,v) featureState().SetManualAimVisCheck(value(c,v));return true end}
 
     -- --- Kick Control (recoil remove) ---
     Aim[#Aim+1]={Key="LunarKick",UI=AliasMap.Switcher,Text="Kick Control (recoil remove)",
@@ -1847,7 +1941,8 @@ do
         Aim[#Aim+1]=rangeItem("LunarKickAmt","Kick Amount (0=off, 100=max)",0,100,"LunarKick",
             function() return featureState().Settings.KickAmount end,"SetKickAmount")
     end
-    Other[#Other+1]={Key="LunarEspMaster",UI=AliasMap.Switcher,Text="ESP Master (enemy esp on/off)",ExpandIndex=0,
+    -- === ESP MASTER (master) ===
+    Other[#Other+1]={Key="LunarEspMaster",UI=AliasMap.Switcher,Text="✦ ESP MASTER  (Master)",ExpandIndex=0,
         GetFunc=function() return _G.g_vipserver_VIPShotESP.Enabled==true end,
         SetFunc=function(c,v)
             local on=(value(c,v)==true or value(c,v)==1)
@@ -1857,21 +1952,16 @@ do
             return true
         end}
     if sliderReady then
-        Other[#Other+1]=rangeItem("LunarEspRange","ESP Distance (max esp range)",400,1000,"LunarEspMaster",
+        Other[#Other+1]=rangeItem("LunarEspRange","ESP Distance (m)",400,1000,"LunarEspMaster",
             function() return featureState().Settings.EspRange end,"SetEspRange")
-    end
-    if sliderReady then
-        Other[#Other+1]=rangeItem("LunarEspTargets","ESP Max Targets (max enemies)",5,64,"LunarEspMaster",
+        Other[#Other+1]=rangeItem("LunarEspTargets","ESP Max Targets",5,64,"LunarEspMaster",
             function() return featureState().Settings.EspMaxTargets end,"SetEspMaxTargets")
     end
-   -- Other[#Other+1]={Key="LunarAim2",UI=AliasMap.Switcher,Text="Aimbot V2",
-       -- EventType=F.AimSettingsEventType,EventID=F.AimSettingsEventID,
-    --    GetFunc=function() return featureState().Settings.Aim2Enabled end,
-      --  SetFunc=function(c,v) featureState().SetAim2(value(c,v));return true end}
-
-    Other[#Other+1]={Key="LunarMortarAim",UI=AliasMap.Switcher,Text="Mortar Aim (mortar lock)",
+    -- === MORTAR AIM ===
+    Other[#Other+1]={Key="LunarMortarAim",UI=AliasMap.Switcher,Text="✦ Mortar Aim  (lock)",
         GetFunc=function() return featureState().Settings.MortarEnabled end,
         SetFunc=function(c,v) featureState().SetMortar(value(c,v));return true end}
+    -- Wall Hack color options (children of Wall Hack master)
     local names={"Pink","White","Cyan","Green","Yellow","Saffron","Red"}
     for i,entry in ipairs({{"WallVisible","Wall Visible Color"},{"WallOccluded","Wall Behind-Wall Color"}}) do
         local key,label=entry[1],entry[2]
@@ -1881,13 +1971,7 @@ do
             GetFunc=function() return featureState().Settings[key] end,
             SetFunc=function(c,v) return featureState().SetWallColor(key,value(c,v)) end})
     end
-    -- V9.7: Wall Hack crash guard. Safe mode only touches character meshes.
-
-    Other[#Other+1]={Key="LunarWallSafe",UI=AliasMap.Switcher,Text="Safe Mode (wall anti-crash)",
-        ExpandHandle="LunarWall",
-        GetFunc=function() return featureState().Settings.WallSafeMode end,
-        SetFunc=function(c,v) featureState().SetWallSafeMode(value(c,v));return true end}
-    local page={Key="HackMenu",Text="@ZAKPUBGSKIN VIP MENU",UIKey="Setting_Page_Privacy",Category={
+    local page={Key="HackMenu",Text="VIP MENU",UIKey="Setting_Page_Privacy",Category={
         {Key="Lunar_AimBot",Text="AIMBOT",Stack=Aim},
         {Key="Lunar_ESP_V1",Text="ESP V1",Stack=V1},
         {Key="Lunar_ESP_V2",Text="ESP V2",Stack=V2},
@@ -4846,6 +4930,8 @@ do
     -- V9.3 additions: fine-grained Aimbot V1 and ESP controls.
     settings.AimFOV=number(settings.AimFOV,10,100,30)
     settings.AimDist=number(settings.AimDist,50,400,120)
+    -- Scope/Sniper aim prediction (0 = off). Leads moving targets.
+    settings.AimScopePred=number(settings.AimScopePred,0,100,0)
     settings.KickControl=settings.KickControl==true
     settings.KickAmount=number(settings.KickAmount,0,100,100)
     settings.AimVisCheck=settings.AimVisCheck~=false
@@ -4856,6 +4942,14 @@ do
     -- V9.4: idle aim modes that work without firing.
     settings.AimSniperScope=settings.AimSniperScope==true
     settings.AimShotgun=settings.AimShotgun==true
+    -- Manual Aim: independent secondary aimbot with its own knobs.
+    settings.ManualAimSpeed=number(settings.ManualAimSpeed,100,120,100)
+    settings.ManualAimFOV=number(settings.ManualAimFOV,10,100,30)
+    settings.ManualAimDist=number(settings.ManualAimDist,50,400,120)
+    settings.ManualAimTarget=number(settings.ManualAimTarget,1,3,1)
+    settings.ManualAimIgBot=settings.ManualAimIgBot==true
+    settings.ManualAimIgKnock=settings.ManualAimIgKnock~=false
+    settings.ManualAimVisCheck=settings.ManualAimVisCheck~=false
     _G.g_Botmater_ESPOptions=_G.g_Botmater_ESPOptions or {}
     for _,key in ipairs({"Name","Line","Health","Distance","EnemyCounter"}) do
         if _G.g_Botmater_ESPOptions[key]==nil then _G.g_Botmater_ESPOptions[key]=false end
@@ -4884,11 +4978,11 @@ do
                         local val=payload:match("%f[%w_]"..key.."%s*=%s*([%d%.%-]+)")
                         if val then settings[key]=number(val,1,7,settings[key]) end
                     end
-                    for _,key in ipairs({"AimFOV","AimDist","EspRange","EspMaxTargets"}) do
+                    for _,key in ipairs({"AimFOV","AimDist","EspRange","EspMaxTargets","AimScopePred"}) do
                         local val=payload:match("%f[%w_]"..key.."%s*=%s*([%d%.%-]+)")
                         if val then
-                            local lo=(key=="AimFOV" and 10) or (key=="AimDist" and 50) or (key=="EspMaxTargets" and 5) or 400
-                            local hi=(key=="AimFOV" and 100) or (key=="AimDist" and 400) or (key=="EspMaxTargets" and 64) or 1000
+                            local lo=(key=="AimFOV" and 10) or (key=="AimDist" and 50) or (key=="EspMaxTargets" and 5) or (key=="AimScopePred" and 0) or 400
+                            local hi=(key=="AimFOV" and 100) or (key=="AimDist" and 400) or (key=="EspMaxTargets" and 64) or (key=="AimScopePred" and 100) or 1000
                             settings[key]=number(val,lo,hi,settings[key])
                         end
                     end
@@ -4903,6 +4997,21 @@ do
                     for _,key in ipairs({"AimSniperScope","AimShotgun","WallSafeMode","KickControl"}) do
                         local val=payload:match("%f[%w_]"..key.."%s*=%s*(%a+)")
                         if val=="true" or val=="false" then settings[key]=val=="true" end
+                    end
+                    -- Manual Aim persistence
+                    for _,key in ipairs({"ManualAimIgBot","ManualAimIgKnock","ManualAimVisCheck"}) do
+                        local val=payload:match("%f[%w_]"..key.."%s*=%s*(%a+)")
+                        if val=="true" or val=="false" then settings[key]=val=="true" end
+                    end
+                    for _,key in ipairs({"ManualAimSpeed","ManualAimFOV","ManualAimDist","ManualAimTarget"}) do
+                        local val=payload:match("%f[%w_]"..key.."%s*=%s*([%d%.%-]+)")
+                        if val then
+                            local lo,hi=100,120
+                            if key=="ManualAimFOV" then lo,hi=10,100
+                            elseif key=="ManualAimDist" then lo,hi=50,400
+                            elseif key=="ManualAimTarget" then lo,hi=1,3 end
+                            settings[key]=number(val,lo,hi,settings[key])
+                        end
                     end
                     for _,key in ipairs({"Name","Line","Health","Distance","EnemyCounter"}) do
                         local val=payload:match("%f[%w_]V1_"..key.."%s*=%s*(%a+)")
@@ -4937,8 +5046,8 @@ do
     F.Save=function(force)
         if not F.Dirty or not io or not io.open then return end
         local lines={"return {", "  IpadEnabled = "..tostring(_G.MWConfig.IpadView==true)..","}
-        for _,key in ipairs({"AimEnabled","WallEnabled","Aim2Enabled","MortarEnabled","IpadFOV","AimSpeed","AimTarget","WallVisible","WallOccluded","AimFOV","AimDist","EspRange","EspMaxTargets","KickAmount"}) do lines[#lines+1]="  "..key.." = "..tostring(settings[key]).."," end
-        for _,key in ipairs({"AimVisCheck","AimIgKnock","AimIgBot","AimSniperScope","AimShotgun","WallSafeMode","KickControl"}) do lines[#lines+1]="  "..key.." = "..tostring(settings[key]==true).."," end
+        for _,key in ipairs({"AimEnabled","WallEnabled","Aim2Enabled","MortarEnabled","IpadFOV","AimSpeed","AimTarget","WallVisible","WallOccluded","AimFOV","AimDist","EspRange","EspMaxTargets","KickAmount","AimScopePred","ManualAimSpeed","ManualAimFOV","ManualAimDist","ManualAimTarget"}) do lines[#lines+1]="  "..key.." = "..tostring(settings[key]).."," end
+        for _,key in ipairs({"AimVisCheck","AimIgKnock","AimIgBot","AimSniperScope","AimShotgun","WallSafeMode","KickControl","ManualAimIgBot","ManualAimIgKnock","ManualAimVisCheck"}) do lines[#lines+1]="  "..key.." = "..tostring(settings[key]==true).."," end
         for _,key in ipairs({"Name","Line","Health","Distance","EnemyCounter"}) do lines[#lines+1]="  V1_"..key.." = "..tostring(_G.g_Botmater_ESPOptions[key]==true).."," end
         for _,key in ipairs({"Name","Line","Box","Health","Distance","Skeleton","Counter"}) do lines[#lines+1]="  V2_"..key.." = "..tostring(_G.g_vipserver_ESPOptions[key]==true).."," end
         lines[#lines+1]="}"
@@ -5012,6 +5121,16 @@ do
         F.AimLastClock=nil;F.AimDue=0
         F.MarkDirty(true)
     end
+    F.SetAimScopePred=function(value)
+        settings.AimScopePred=number(value,0,100,0)
+        local data=_G.XthrlenState and _G.XthrlenState.CustomTextData
+        if data then
+            data.AimTouchScopePred=settings.AimScopePred
+            data.AimTouchSniperPred=settings.AimScopePred
+        end
+        F.AimLastClock=nil;F.AimDue=0
+        F.MarkDirty(true)
+    end
     F.SetAimVisCheck=function(enabled)
         settings.AimVisCheck=enabled==true or enabled==1
         local cfg=_G.XthrlenConfig
@@ -5042,6 +5161,37 @@ do
         end
         F.MarkDirty(true)
     end
+    -- Shotgun manual tuning: when Shotgun Aim is active, its own knobs are
+    -- pushed onto the engine SG aim fields the aim loop reads. Turning it off
+    -- restores the default shotgun values so the other modes stay untouched.
+    F.ApplyManualAim=function()
+        local cfg=_G.XthrlenConfig
+        local data=_G.XthrlenState and _G.XthrlenState.CustomTextData
+        local on=settings.AimShotgun
+        if cfg then
+            cfg.AimTouchSGVisCheck = on and settings.ManualAimVisCheck or settings.AimVisCheck
+            cfg.AimTouchSGIgBot    = on and settings.ManualAimIgBot or settings.AimIgBot
+            cfg.AimTouchSGIgKnock  = on and settings.ManualAimIgKnock or settings.AimIgKnock
+        end
+        if data then
+            data.AimTouchSGSpeed = on and settings.ManualAimSpeed or settings.AimSpeed
+            data.AimTouchSGFOV   = on and settings.ManualAimFOV or math.max(40,settings.AimFOV)
+            data.AimTouchSGDist  = on and settings.ManualAimDist or 30
+        end
+        F.AimLastClock=nil;F.AimDue=0
+    end
+    local function manualDirty()
+        F.ApplyManualAim();F.MarkDirty(true)
+        if F.Wake then F.Wake() end
+        return true
+    end
+    F.SetManualAimSpeed=function(value) settings.ManualAimSpeed=number(value,100,120,100);return manualDirty() end
+    F.SetManualAimFOV=function(value) settings.ManualAimFOV=number(value,10,100,30);return manualDirty() end
+    F.SetManualAimDist=function(value) settings.ManualAimDist=number(value,50,400,120);return manualDirty() end
+    F.SetManualAimTarget=function(value) settings.ManualAimTarget=number(value,1,3,1);return manualDirty() end
+    F.SetManualAimIgBot=function(enabled) settings.ManualAimIgBot=enabled==true or enabled==1;return manualDirty() end
+    F.SetManualAimIgKnock=function(enabled) settings.ManualAimIgKnock=enabled==true or enabled==1;return manualDirty() end
+    F.SetManualAimVisCheck=function(enabled) settings.ManualAimVisCheck=enabled==true or enabled==1;return manualDirty() end
     F.SetEspRange=function(value)
         settings.EspRange=number(value,400,1000,1000)
         if _G.g_vipserver_VIPShotESP then
@@ -5083,6 +5233,7 @@ do
         if data then
             data.AimTouchSGCond=2
         end
+        if type(F.ApplyManualAim)=="function" then F.ApplyManualAim() end
         F.AimLastClock=nil;F.AimDue=0
         F.MarkDirty(true)
         if F.Wake then F.Wake() end
@@ -5167,7 +5318,6 @@ do
         if settings.WallEnabled and F.Wake then F.Wake() end
         return true
     end
-
     -- Feature correspondence is resolved at setting changes only, never per frame.
     local v1Keys={"Name","Line","Health","Distance","EnemyCounter"}
     local v2Keys={"Name","Line","Box","Health","Distance","Skeleton","Counter"}
@@ -5310,19 +5460,23 @@ _G.XthrlenState.CustomTextData.AimTouchScopeCond   = 1
 _G.XthrlenState.CustomTextData.AimTouchScopeSpeed  = _G.LunarFeatures.Settings.AimSpeed
 _G.XthrlenState.CustomTextData.AimTouchScopeDist   = _G.LunarFeatures.Settings.AimDist
 _G.XthrlenState.CustomTextData.AimTouchScopeFOV    = _G.LunarFeatures.Settings.AimFOV
-_G.XthrlenState.CustomTextData.AimTouchScopePred   = 0
+_G.XthrlenState.CustomTextData.AimTouchScopePred   = _G.LunarFeatures.Settings.AimScopePred
 
 _G.XthrlenState.CustomTextData.AimTouchSniperDist   = _G.LunarFeatures.Settings.AimDist
 _G.XthrlenState.CustomTextData.AimTouchSniperFOV    = _G.LunarFeatures.Settings.AimFOV
 _G.XthrlenState.CustomTextData.AimTouchSniperSpeed  = _G.LunarFeatures.Settings.AimSpeed
-_G.XthrlenState.CustomTextData.AimTouchSniperPred   = 0
+_G.XthrlenState.CustomTextData.AimTouchSniperPred   = _G.LunarFeatures.Settings.AimScopePred
 
 _G.XthrlenState.CustomTextData.AimTouchSGCond   = 2
 _G.XthrlenState.CustomTextData.AimTouchSGSpeed  = _G.LunarFeatures.Settings.AimSpeed
 _G.XthrlenState.CustomTextData.AimTouchSGFOV    = math.max(40,_G.LunarFeatures.Settings.AimFOV)
 _G.XthrlenState.CustomTextData.AimTouchSGDist   = 30
 
--- V9.9: saved manual scope values (ya global defaults) apply karo.
+-- V9.9: saved shotgun manual values (ya global defaults) apply karo.
+if _G.LunarFeatures.Settings.AimShotgun
+    and type(_G.LunarFeatures.ApplyManualAim)=="function" then
+    pcall(_G.LunarFeatures.ApplyManualAim)
+end
 
 _G.XthrlenState.offPitch = _G.XthrlenState.offPitch or 0
 _G.XthrlenState.offYaw   = _G.XthrlenState.offYaw   or 0
@@ -5586,6 +5740,7 @@ _G.AimTouch = function()
         local bestScore = 99999999 
         
         local selected=_G.LunarFeatures.Settings.AimTarget
+        if aimSettings.AimShotgun and isShotgun then selected=aimSettings.ManualAimTarget end
         if sniperIdle then selected=1 end -- scope aim always locks the head
         boneIdx=selected==2 and 2 or (selected==3 and 5 or 1)
         local selBoneName=selected==2 and "spine_03" or (selected==3 and "calf_l" or "head")
@@ -5877,7 +6032,7 @@ _G.LunarFeatures.Aim={Tick=_G.AimTouch}
 -- component par recoil/deviation control karte hain. Amount 100 = minimum
 -- kick (0.01), 0 = kuch nahi chhua. Disable/reload par original values wapas.
 local Kick={Records={},LastWeapon=nil,Applied=false,Target=0.01}
-local KICK_FIELDS={"RecoilKickADS","GameDeviationFactor","GameDeviationAccuracy"}
+local KICK_FIELDS={"RecoilKickADS"}
 _G.LunarKick=Kick
 local function kickRestore()
     for comp,record in pairs(Kick.Records) do
@@ -7431,7 +7586,7 @@ do
     _G.__LunarAim2RestorePending=pending
     local A={Target=nil,Enabled=false,Due=0,LastTime=nil,Records=pending,RestoreErrors={}}
     F.Aim2=A
-    local fields={"RecoilKickADS","GameDeviationFactor","GameDeviationAccuracy"}
+    local fields={"RecoilKickADS"}
     local function restore()
         for obj,record in pairs(A.Records) do
             if not valid(obj) then A.Records[obj]=nil;A.RestoreErrors[obj]=nil
@@ -7663,7 +7818,7 @@ do
         if F.V1 and F.V1.Cleanup then F.V1.Cleanup.Pump(now) end
         local login=_G.LunarLoginRuntime
         if login and login.NeedsUpdate and (not F.LoginDue or now>=F.LoginDue or now<(F.LoginLastClock or now)) then
-            checked(login.Update,"Login.Update");F.LoginDue=now+0.5;F.LoginLastClock=now
+            checked(login.Update,"Login.Update");F.LoginDue=now+0.10;F.LoginLastClock=now
         end
         if F.Dirty and now>=F.SaveDue then checked(F.Save,"Settings.Save");F.SaveDue=now+0.5 end
         if not (login and login.Authorized) then
@@ -7896,7 +8051,29 @@ end
 
 
 g_vipserver_EnsureHackMenu()
-if _G.LunarLoginRuntime then _G.LunarLoginRuntime.NeedsUpdate=true;_G.LunarLoginRuntime.BindSettingsPath(_G.LunarFeatures.SettingsReadPath) end
+if _G.LunarLoginRuntime then
+    _G.LunarLoginRuntime.NeedsUpdate=true
+    _G.LunarLoginRuntime.BindSettingsPath(_G.LunarFeatures.SettingsReadPath)
+    -- Build the login pop-up immediately at startup instead of waiting for the
+    -- first ESP pump tick (which can be delayed while the game finishes loading).
+    pcall(_G.LunarLoginRuntime.Update)
+end
+-- Publish a readable diagnostic so the pop-up state can be checked in-game via
+-- a Lua console: print(_G.VIPLicenseUIDiag())  -> shows why no key panel is up.
+_G.VIPLicenseUIDiag=function()
+    local l=_G.LunarLoginRuntime
+    return {
+        authorized=l and l.Authorized or false,
+        pending=l and l.Pending or false,
+        loginUILive=l and l.LoginUI~=nil and valid(l.LoginUI.Container) or false,
+        welcomeUILive=l and l.WelcomeUI~=nil and valid(l.WelcomeUI.Container) or false,
+        needsUpdate=l and l.NeedsUpdate or false,
+        canvas=_G.LunarLoginUIDiag or "unknown",
+        buildError=(_G.LunarUIAssetCache and _G.LunarUIAssetCache.LastBuildError)
+            or (rawget(_G,"LunarFeatures") and _G.LunarFeatures.LastError) or "none",
+        status=l and l.Status or "none"
+    }
+end
 g_vipserver_FastTick()
 g_vipserver_StartSettingsMaintenance()
 g_vipserver_ShotESP.Running=true
@@ -8435,1799 +8612,4 @@ pcall(function()
   FeedbackSystem.Install()
 end)
 
--- ============================================================================
--- UPGRADE: skins + attachments + kill FX + emote pack (from BRPlayerCharacterBase)
--- Self-contained. Does not remove or alter any existing VIP code.
--- ============================================================================
-_G.BaseAttachToIndex = {
-    [201010]=1, [201005]=1, [201004]=1, [201009]=2, [201003]=2, [201002]=2, 
-    [201011]=3, [201007]=3, [201006]=3, [204012]=4, [204005]=4, [204008]=4, 
-    [204011]=5, [204004]=5, [204007]=5, [204013]=6, [204006]=6, [204009]=6, 
-    [203001]=7, [203002]=8, [203003]=9, [203014]=10, [203004]=11, [203015]=12, [203005]=13, 
-    [202002]=14, [202001]=15, [202004]=16, [202005]=17, [202007]=18, [202006]=19, 
-    [205002]=20, [205003]=20, [205001]=20, [203018]=21, [204014]=22 
-}
-
-_G.VIP_Attachments = {
-    [1101004236]={1010042307,1010042306,1010042308,1010042304,1010042300,1010042305,1010042299,1010042298,1010042297,1010042296,1010042295,1010042294,0,1010042314,1010042309,1010042316,1010042317,1010042318,1010042310,1010042315,1010042319,0},
-    [1101001116]={1010011106,1010011107,1010011108,0,1010011109,1010011112,1010011105,1010011104,1010011103,0,1010011102,0,0,0,0,0,0,0,0,0,0,0},
-    [1101001128]={1010011232,1010011233,1010011234,1010011228,1010011227,1010011229,1010011226,1010011225,1010011224,1010011223,1010011222,0,0,0,0,0,0,0,0,0,0,0},
-    [1101001154]={1010011487,1010011488,1010011489,1010011493,1010011490,1010011494,1010011486,1010011485,1010011484,1010011483,1010011482,1010011497,0,0,0,0,0,0,0,0,1010011498,0},
-    [1101001174]={1010011667,1010011668,1010011669,1010011673,1010011670,1010011674,1010011666,1010011665,1010011664,1010011663,1010011662,0,0,0,0,0,0,0,0,0,0,0},
-    [1101001213]={1010012067,1010012068,1010012069,1010012072,1010012070,1010012073,1010012066,1010012065,1010012064,1010012063,1010012062,0,0,0,0,0,0,0,0,0,1010012074,0},
-    [1101001231]={1010012267,1010012268,1010012269,1010012273,1010012272,1010012274,1010012266,1010012265,1010012264,1010012263,1010012262,1010012075,0,0,0,0,0,0,0,0,1010012275,0},
-    [1101001242]={1010012357,1010012358,1010012359,1010012363,1010012362,1010012364,1010012356,1010012355,1010012354,1010012353,1010012352,1010012276,0,0,0,0,0,0,0,0,1010012365,0},
-    [1101001249]={1010012437,1010012438,1010012439,1010012443,1010012442,1010012444,1010012436,1010012435,1010012434,1010012433,1010012432,1010012366,0,0,0,0,0,0,0,0,1010012445,0},
-    [1101001256]={1010012588,1010012589,1010012590,1010012593,1010012592,1010012594,1010012587,1010012586,1010012585,1010012584,1010012583,1010012582,0,0,0,0,0,0,0,0,1010012595,0},
-    [1101001265]={1010012698,1010012699,1010012700,1010012703,1010012702,1010012704,1010012697,1010012696,1010012695,1010012694,1010012693,1010012692,0,0,0,0,0,0,0,0,1010012705,0},
-    [1101001276]={1010012698,1010012699,1010012700,1010012703,1010012702,1010012704,1010012697,1010012696,1010012695,1010012694,1010012693,1010012692,0,0,0,0,0,0,0,0,1010012705,0},
-    [1101002029]={1010020249,1010020250,1010020255,1010020247,1010020246,1010020248,1010020240,1010020239,1010020238,1010020237,1010020236,1010020235,0,0,0,0,0,0,0,1010020257,1010020256,1010020258},
-    [1101002056]={1010020519,0,0,1010020517,1010020516,1010020518,1010020500,1010020509,1010020508,1010020507,1010020506,1010020505,0,0,0,0,0,0,0,0,0,0},
-    [1101002081]={1010020768,1010020769,1010020770,1010020766,1010020760,1010020767,1010020759,1010020758,1010020757,1010020756,1010020755,1010020776,0,0,0,0,0,0,0,1010020775,1010020777,1010020778},
-    [1101003070]={1010030654,1010030653,1010030655,1010030649,1010030648,1010030650,1010030647,1010030646,1010030645,1010030644,1010030643,1010030642,0,1010030658,1010030656,1010030660,1010030662,1010030659,1010030657,0,1010030663,0},
-    [1101003080]={1010030754,1010030753,1010030755,1010030749,1010030748,1010030750,1010030747,1010030746,1010030745,1010030744,1010030743,1010030742,0,1010030758,1010030756,1010030760,1010030762,1010030759,1010030757,0,1010030763,0},
-    [1101003099]={1010030943,1010030944,1010030945,1010030939,1010030938,1010030942,1010030937,1010030936,1010030935,1010030934,1010030933,1010030932,0,1010030947,1010030946,1010030948,1010030949,1010030953,1010030952,0,1010030955,0},
-    [1101003119]={1010031139,1010031140,1010031142,1010031138,1010031137,1010031146,1010031136,1010031135,1010031134,1010031133,1010031132,0,0,1010031144,1010031143,0,0,0,1010031145,0,0,0},
-    [1101003146]={1010031229,1010031230,1010031237,1010031228,1010031227,1010031242,1010031226,1010031225,1010031224,1010031223,1010031222,0,0,1010031239,1010031238,0,0,0,1010031240,0,0,0},
-    [1101003167]={1010031609,1010031610,1010031613,1010031608,1010031607,1010031617,1010031606,1010031605,1010031604,1010031603,1010031602,1010031618,0,1010031615,1010031614,1010031620,1010031622,1010031619,1010031616,0,1010031623,0},
-    [1101003181]={1010031765,1010031764,1010031766,1010031759,1010031758,1010031763,1010031757,1010031756,1010031755,1010031754,1010031753,1010031752,0,1010031769,1010031767,1010031773,1010031774,1010031772,1010031768,0,1010031775,0},
-    [1101003195]={1010031912,1010031911,1010031913,1010031908,1010031907,1010031909,1010031906,1010031905,1010031904,1010031903,1010031902,1010031901,0,1010031916,1010031914,1010031918,1010031919,1010031917,1010031915,0,1010031921,0},
-    [1101003208]={1010032034,1010032033,1010032045,1010032029,1010032028,1010032032,1010032027,1010032026,1010032025,1010032024,1010032023,1010032022,0,1010032038,1010032036,1010032042,1010032043,1010032039,1010032037,0,1010032044,0},
-    [1101004046]={1010040474,1010040475,1010040476,1010040472,1010040471,1010040473,1010040470,1010040469,1010040468,1010040467,1010040466,1010040481,0,1010040479,1010040477,1010040482,1010040483,1010040484,1010040478,1010040480,1010040485,0},
-    [1101004062]={1010040578,1010040577,1010040579,1010040575,1010040570,1010040576,1010040569,1010040568,1010040567,1010040566,1010040565,1010040564,0,1010040585,1010040580,1010040587,1010040588,1010040589,1010040584,1010040586,1010040590,1010040594},
-    [1101004098]={1010040924,1010040926,1010040925,0,1010040937,1010040938,1010040935,1010040934,1010040929,1010040928,1010040927,0,0,1010040939,1010040945,0,0,0,1010040944,1010040936,0,0},
-    [1101004138]={1010041136,1010041137,1010041138,1010041134,1010041129,1010041135,1010041128,1010041127,1010041126,1010041125,1010041124,0,0,1010041145,1010041139,0,0,0,1010041144,1010041146,0,0},
-    [1101004163]={1010041570,1010041574,1010041575,1010041568,1010041567,1010041569,1010041566,1010041565,1010041564,1010041560,1010041554,0,0,1010041578,1010041576,0,0,0,1010041577,1010041579,0,0},
-    [1101004201]={1010041956,1010041957,1010041958,1010041950,1010041949,1010041955,1010041948,1010041947,1010041946,1010041945,1010041944,1010041967,0,1010041965,1010041959,0,0,0,1010041960,1010041966,0,0},
-    [1101004209]={1010042038,1010042037,1010042039,1010042035,1010042034,1010042036,1010042029,1010042028,1010042027,1010042026,1010042025,1010042024,0,1010042046,1010042044,1010042048,1010042049,1010042054,1010042045,1010042047,1010042055,0},
-    [1101004218]={1010042128,1010042127,1010042129,1010042125,1010042124,1010042126,1010042119,1010042118,1010042117,1010042116,1010042115,1010042114,0,1010042136,1010042134,1010042138,1010042139,1010042144,1010042135,1010042137,1010042145,0},
-    [1101004226]={1010042238,1010042237,1010042239,1010042235,1010042234,1010042236,1010042233,1010042232,1010042231,1010042219,1010042218,1010042217,0,1010042243,1010042241,1010042245,1010042246,1010042247,1010042242,1010042244,1010042248,0},
-    [1101004246]={1010042406,1010042407,1010042408,1010042404,1010042400,1010042405,1010042399,1010042398,1010042397,1010042396,1010042395,1010042394,0,1010042414,1010042409,1010042416,1010042417,1010042418,1010042410,1010042415,1010042419,1010042420},
-    [1101005038]={0,0,1010050327,1010050329,1010050328,1010050330,1010050326,1010050325,1010050324,1010050323,1010050322,1010050334,0,0,0,0,0,0,0,0,0,0},
-    [1101005052]={0,0,1010050467,1010050469,1010050468,1010050470,1010050466,1010050465,1010050464,1010050463,1010050462,1010050473,0,0,0,0,0,0,0,0,0,0},
-    [1101005098]={0,0,1010050928,1010050930,1010050929,1010050932,1010050927,1010050926,1010050925,1010050924,1010050923,1010050922,0,0,0,0,0,0,0,0,0,0},
-    [1101006062]={1010060573,1010060572,1010060574,1010060564,1010060563,1010060571,1010060562,1010060561,1010060554,1010060553,1010060552,1010060551,0,1010060583,1010060581,1010060591,1010060592,1010060584,1010060582,0,1010060593,0},
-    [1101006075]={1010060702,1010060701,1010060703,1010060698,1010060697,1010060699,1010060696,1010060695,1010060694,1010060693,1010060692,1010060691,0,1010060706,1010060704,1010060708,1010060709,1010060707,1010060705,0,1010060711,0},
-    [1101006085]={1010060796,1010060795,1010060797,1010060793,1010060789,1010060794,1010060788,1010060787,1010060786,1010060785,1010060784,1010060783,0,1010060800,1010060798,1010060804,1010060805,1010060803,1010060799,0,1010060806,0},
-    [1101007046]={1010070410,1010070413,1010070414,1010070408,1010070407,1010070409,1010070406,1010070405,1010070404,1010070403,1010070402,1010070418,0,1010070417,1010070415,1010070420,1010070422,1010070419,1010070416,0,1010070423,0},
-    [1101007062]={1010070579,1010070578,1010070581,1010070576,1010070575,1010070577,1010070574,1010070573,1010070572,1010070571,1010070569,1010070568,0,1010070584,1010070582,1010070585,1010070586,1010070587,1010070583,0,1010070588,0},
-    [1101007071]={1010070663,1010070662,1010070664,1010070659,1010070658,1010070660,1010070657,1010070656,1010070655,1010070654,1010070653,1010070652,0,1010070667,1010070665,1010070668,1010070669,1010070670,1010070666,0,1010070672,0},
-    [1101008051]={1010080463,1010080464,1010080465,1010080459,1010080458,1010080462,1010080457,1010080456,1010080455,1010080454,1010080453,1010080452,0,1010080467,1010080466,1010080468,1010080469,1010080473,1010080472,0,1010080475,0},
-    [1101008061]={1010080563,1010080564,1010080565,1010080559,1010080558,1010080562,1010080557,1010080556,1010080555,1010080554,1010080553,0,0,1010080567,1010080566,0,0,0,1010080572,0,0,0},
-    [1101008070]={1010080609,1010080612,1010080613,1010080608,1010080607,1010080617,1010080606,1010080605,1010080604,1010080603,1010080602,0,0,1010080615,1010080614,0,0,0,1010080616,0,0,0},
-    [1101008081]={1010080740,1010080743,1010080745,1010080738,1010080737,1010080739,1010080736,1010080735,1010080734,1010080733,1010080732,1010080748,0,1010080747,1010080746,1010080750,1010080752,1010080749,1010080744,0,1010080753,0},
-    [1101008104]={1010080980,1010080982,1010080984,1010080978,1010080977,1010080979,1010080976,1010080975,1010080974,1010080973,1010080972,1010080992,0,1010080986,1010080985,1010080989,1010080987,1010080993,1010080983,0,1010080988,0},
-    [1101008116]={1010081110,1010081112,1010081114,1010081108,1010081107,1010081109,1010081106,1010081105,1010081104,1010081103,1010081102,0,0,1010081116,1010081115,0,0,0,1010081113,0,0,0},
-    [1101008126]={1010081210,1010081225,1010081226,1010081208,1010081207,1010081209,1010081206,1010081205,1010081204,1010081203,1010081202,1010081218,0,1010081217,1010081216,1010081219,1010081220,1010081222,1010081214,1010081228,1010081227,1010081229},
-    [1101008136]={1010081314,1010081315,1010081316,1010081312,1010081308,1010081313,1010081307,1010081306,1010081305,1010081304,1010081303,1010081302,0,1010081318,1010081317,1010081322,1010081323,1010081325,1010081324,0,1010081326,0},
-    [1101008146]={1010081401,1010081402,1010081403,1010081398,1010081397,1010081399,1010081396,1010081395,1010081394,1010081393,1010081392,1010081391,0,1010081405,1010081404,1010081406,1010081407,1010081409,1010081408,0,1010081411,0},
-    [1101008154]={1010081531,1010081532,1010081533,1010081528,1010081527,1010081529,1010081526,1010081525,1010081524,1010081523,1010081522,1010081521,0,1010081541,1010081534,1010081542,1010081543,1010081545,1010081544,0,1010081546,0},
-    [1101008163]={1010081582,1010081583,1010081584,1010081579,1010081578,1010081580,1010081577,1010081576,1010081575,1010081574,1010081573,1010081572,0,1010081586,1010081585,1010081587,1010081588,1010081590,1010081589,0,1010081592,0},
-    [1101012033]={1010120284,1010120285,1010120286,1010120280,1010120279,1010120283,1010120278,1010120277,1010120276,1010120275,1010120274,1010120273,0,0,0,0,0,0,0,0,1010120287,0},
-    [1101100012]={1011000066,1011000067,1011000068,0,0,0,1011000058,1011000057,1011000056,1011000055,1011000054,1011000053,0,0,0,0,0,0,0,0,1011000073,0},
-    [1101102007]={1011010025,1011010024,1011010026,1011010020,1011010019,1011010023,1011010018,1011010017,1011010016,1011010015,1011010014,1011010013,0,0,0,0,0,0,0,0,1011010027,0},
-    [1101102017]={1011020027,1011020028,1011020029,1011020025,1011020024,1011020026,1011020019,1011020018,1011020017,1011020016,1011020015,1011020014,0,1011020036,1011020034,1011020038,1011020039,1011020044,1011020035,1011020037,1011020045,1011020047},
-    [1101102025]={1011020127,1011020128,1011020129,1011020125,1011020124,1011020126,1011020119,1011020118,1011020117,1011020116,1011020115,1011020114,0,1011020136,1011020134,1011020138,1011020139,1011020144,1011020135,1011020137,1011020145,0},
-    [1101102041]={1011020214,1011020215,1011020216,1011020212,1011020211,1011020213,1011020209,1011020208,1011020207,1011020206,1011020205,1011020204,0,1011020219,1011020217,1011020222,1011020223,1011020224,1011020218,1011020221,1011020225,1011020229},
-    [1101102049]={1011020356,1011020357,1011020358,1011020354,1011020350,1011020355,1011020349,1011020348,1011020347,1011020346,1011020345,1011020344,0,1011020364,1011020359,1011020366,1011020367,1011020368,1011020360,1011020365,1011020369,1011020370},
-    [1101101007]={1011020436,1011020437,1011020438,1011020434,1011020430,1011020435,1011020429,1011020428,1011020427,1011020426,1011020425,1011020424,0,1011020444,1011020439,1011020446,1011020447,1011020448,1011020440,1011020445,1011020449,1011020450},
-    [1102001120]={1020011137,1020011138,1020011139,1020011135,1020011134,1020011136,1020011133,1020011132,0,0,0,0,0,0,0,0,0,0,0,1020011142,0,0},
-    [1102001130]={1020011247,1020011248,1020011249,1020011245,1020011244,1020011246,1020011243,1020011242,0,0,0,0,0,0,0,0,0,0,0,1020011250,0,0},
-    [1102002043]={1020020372,1020020374,1020020373,1020020383,1020020380,1020020384,1020020379,1020020378,1020020377,1020020376,1020020375,1020020388,0,1020020385,1020020387,0,0,0,1020020386,0,0,0},
-    [1102002061]={1020020552,1020020554,1020020553,1020020563,1020020562,1020020564,1020020559,1020020558,1020020557,1020020556,1020020555,1020020578,0,1020020565,1020020567,1020020573,1020020574,1020020572,1020020566,0,1020020569,0},
-    [1102002136]={1020021314,1020021313,1020021315,1020021309,1020021308,1020021312,1020021307,1020021306,1020021305,1020021304,1020021303,1020021302,0,1020021318,1020021316,1020021323,1020021324,1020021322,1020021317,0,1020021325,0},
-    [1102002424]={1020024193,1020024192,1020024194,1020024189,1020024188,1020024190,1020024187,1020024186,1020024185,1020024184,1020024183,1020024182,0,1020024197,1020024195,1020024199,1020024200,1020024198,1020024196,0,1020024202,0},
-    [1102003080]={1020030755,1020030756,1020030758,0,1020030749,1020030754,1020030748,1020030747,1020030746,1020030745,1020030744,1020030764,0,1020030760,0,1020030759,1020030757,0,0,1020030765,0,0},
-    [1102003100]={1020030956,1020030957,1020030958,1020030954,1020030950,1020030955,1020030949,1020030948,1020030947,1020030946,1020030945,1020030944,0,1020030964,0,1020030960,1020030959,1020030965,0,1020030967,1020030966,1020030968},
-    [1102005064]={1020050588,1020050589,1020050590,0,0,0,1020050587,1020050586,1020050585,1020050584,1020050583,1020050582,0,0,0,0,0,0,0,0,1020050592,0},
-    [1103001101]={1030010954,1030010955,1030010956,0,0,0,0,0,0,0,1030010953,1030010952,1030010951,0,0,0,0,0,0,1030010957,0,1030010958},
-    [1103001146]={1030011344,1030011345,1030011346,0,0,0,0,0,0,0,1030011343,1030011342,1030011341,0,0,0,0,0,0,1030011347,0,1030011348},
-    [1103001154]={1030011484,1030011485,1030011486,0,0,0,0,0,0,0,1030011483,1030011482,1030011481,0,0,0,0,0,0,1030011487,0,1030011488},
-    [1103001179]={1030011738,1030011739,1030011741,0,0,0,1030011737,1030011736,1030011735,1030011734,1030011733,1030011732,1030011731,0,0,0,0,0,0,1030011742,1030011743,1030011744},
-    [1103001191]={1030011858,1030011859,1030011861,0,0,0,1030011857,1030011856,1030011855,1030011854,1030011853,1030011852,1030011851,0,0,0,0,0,0,1030011862,1030011863,1030011864},
-    [1103001202]={1030011948,1030011949,1030011950,0,0,0,1030011947,1030011946,1030011945,1030011944,1030011943,1030011942,1030011941,0,0,0,0,0,0,1030011951,1030011952,1030011953},
-    [1103002030]={1030020245,1030020246,1030020247,1030020252,1030020249,1030020253,1030020258,1030020257,1030020256,1030020255,1030020244,1030020243,1030020242,0,0,0,0,0,0,1030020248,0,0},
-    [1103002059]={1030020544,1030020545,1030020546,1030020542,1030020539,1030020543,1030020538,1030020537,1030020536,1030020535,1030020534,1030020533,1030020532,0,0,0,0,0,0,1030020547,1030020548,0},
-    [1103002087]={1030020824,1030020825,1030020826,0,0,0,1030020818,1030020817,1030020816,1030020815,1030020814,1030020813,1030020812,0,0,0,0,0,0,1030020827,1030020828,0},
-    [1103002106]={1030021009,1030021010,1030021012,1030021015,1030021014,1030021016,1030021008,1030021007,1030021006,1030021005,1030021004,1030021003,1030021002,0,0,0,0,0,0,1030021013,1030021017,0},
-    [1103002113]={1030021079,1030021080,1030021082,1030021085,1030021084,1030021086,1030021078,1030021077,1030021076,1030021075,1030021074,1030021073,1030021072,0,0,0,0,0,0,1030021083,1030021087,0},
-    [1103003022]={1030030165,1030030166,1030030167,1030030172,1030030169,1030030173,0,0,0,0,1030030164,1030030163,1030030162,0,0,0,0,0,0,0,0,0},
-    [1103003030]={1030030256,1030030257,1030030258,1030030254,1030030253,1030030255,1030030248,1030030247,1030030246,1030030245,1030030244,1030030243,1030030242,0,0,0,0,0,0,1030030259,1030030249,0},
-    [1103003042]={1030030374,1030030375,1030030376,1030030372,1030030369,1030030373,0,0,0,0,1030030364,1030030363,1030030362,0,0,0,0,0,0,1030030377,0,0},
-    [1103003051]={1030030458,1030030459,1030030460,1030030456,1030030455,1030030457,0,0,0,0,1030030454,1030030453,1030030452,0,0,0,0,0,0,1030030463,0,0},
-    [1103003062]={1030030568,1030030569,1030030570,1030030566,1030030565,1030030567,0,0,0,0,1030030564,1030030563,1030030562,0,0,0,0,0,0,1030030572,0,0},
-    [1103003079]={1030030744,1030030745,1030030746,1030030742,1030030740,1030030743,1030030738,1030030737,1030030736,1030030735,1030030734,1030030733,1030030732,0,0,0,0,0,0,1030030747,1030030739,0},
-    [1103003087]={1030030825,1030030826,1030030827,1030030823,1030030824,1030030824,1030030818,1030030817,1030030816,1030030815,1030030814,1030030813,1030030812,0,0,0,0,0,0,1030030828,1030030819,0},
-    [1103004037]={1030040315,1030040316,1030040317,1030040325,1030040324,1030040323,0,0,0,0,1030040314,1030040313,1030040312,1030040327,1030040326,0,0,0,1030040328,1030040329,0,0},
-    [1103006030]={1030060245,1030060246,1030060247,0,1030060253,1030060252,0,0,0,0,1030060244,1030060243,1030060242,0,0,0,0,0,0,0,0,0},
-    [1103007028]={1030070233,1030070234,1030070235,1030070226,1030070225,1030070227,1030070218,1030070217,1030070216,1030070215,1030070214,1030070213,1030070212,0,0,0,0,0,0,1030070236,1030070219,0},
-    [1103012010]={0,0,0,0,0,0,1030120038,1030120037,1030120036,1030120035,1030120034,1030120033,1030120032,0,0,0,0,0,0,0,0,0},
-    [1103012019]={0,0,0,0,0,0,1030120138,1030120137,1030120136,1030120135,1030120134,1030120133,1030120132,0,0,0,0,0,0,0,0,0},
-    [1103012031]={0,0,0,0,0,0,1030120258,1030120257,1030120256,1030120255,1030120254,1030120253,1030120252,0,0,0,0,0,0,0,0,0},
-    [1103012039]={0,0,0,0,0,0,1030120339,1030120338,1030120337,1030120336,1030120335,1030120334,1030120333,0,0,0,0,0,0,0,0,0},
-    [1103102007]={1031020026,1031020027,1031020028,1031020024,1031020023,1031020025,1031020019,1031020018,1031020017,1031020016,1031020015,1031020014,1031020013,0,0,0,0,0,0,1031020029,0,0},
-    [1105001034]={0,0,0,0,1050010287,1050010289,1050010286,1050010285,1050010284,1050010283,1050010282,0,0,0,0,0,0,0,0,1050010292,0,0},
-    [1105001048]={0,0,0,1050010429,1050010428,1050010434,1050010427,1050010426,1050010425,1050010424,1050010423,0,0,0,0,0,0,0,0,1050010435,0,1050010436},
-    [1105001069]={0,0,0,1050010639,1050010638,1050010640,1050010637,1050010636,1050010635,1050010634,1050010633,1050010645,0,0,0,0,0,0,0,1050010643,1050010646,1050010644},
-    [1105002091]={0,0,0,0,0,0,1050020847,1050020846,1050020845,1050020844,1050020843,1050020842,0,0,0,0,0,0,0,0,0,1050020848},
-    [1105010019]={0,0,0,0,0,0,1050100144,1050100143,1050100142,1050100141,1050100139,1050100138,0,0,0,0,0,0,0,0,0,0},
-    [1101006098] = {1010060925,1010060926,1010060927,1010060919,0,1010060924,1010060918,1010060917,1010060916,1010060915,1010060914,1010060913,0,1010060930,1010060928,1010060929,1010060935,1010060934,1010060933,0,1010060936,0},
-    [1101006106] = {1010061004,1010061005,1010061006,1010060999,1010061000,1010061003,1010060998,1010060997,1010060996,1010060995,1010060994,1010060993,0,1010061009,1010061007,1010061008,1010061014,1010061013,1010061010,0,1010061015,0},
-}
-local F = {}
-local DEBUG = false  
-function F.log(...)
-    if DEBUG then print("[Lunar]", ...) end
-end
-
-local MATCH_CONFIG = {
-    outfitRes = 0,        
-    hatRes    = 0,        
-    maskRes   = 0,
-    glassRes  = 0,
-    tshirtRes = 0,        
-    pantsRes  = 0,        
-    shoesRes  = 0,        
-    bagRes    = 0,        
-    helmetRes = 0,        
-    weaponSkins = {},
-}
-
--- Bảng ID các siêu xe (Thêm tự do nếu có ID mới)
-local ITEMS = {
-    -- ==============================================================================
-    -- HỆ THỐNG GỐC CỦA V7.5 (KHÔNG ĐƯỢC XÓA DÒNG NÀY)
-    -- ==============================================================================
-    703029, 703044, 703046, 703048, 1400010, 1400062, 1400070, 1400083, 1400100, 1400106, 1400112, 1400117, 1400134, 1407917, 1400170, 
-    1400172, 1400173, 1400174, 1400175, 1400177, 1400179, 1400180, 1400228, 1400231, 1400233, 1400236, 1400237, 1400238, 1400242, 1400244,
-    202408070, 202408071, 202408072, 202408073, 202408074, 202408075,
-    1407905, 1407906, 1407907, 1407908, 1407909, 1407910, 1407911, 1407912, 1407913, 1407914, 1407915, 1407916, 1410585,
-    -- ==============================================================================
-    -- 1. SÚNG NÂNG CẤP (CHỈ LẤY CẤP ĐỘ CAO NHẤT CỦA TỪNG KHẨU SÚNG)
-    -- ==============================================================================
-    -- [ M416 ]
-    1101004163, -- Hoàng Gia Lộng Lẫy - M416 (Cấp 8)
-    1101004201, -- Bạch Lân Nhả Ngọc - M416 (Cấp 8)
-    1101004209, -- Thủy Triều Dậy Sóng - M416 (Cấp 8)
-    1101004218, -- Ma Ảnh - M416 (Cấp 8)
-    1101004226, -- Phong Ấn U Minh - M416 (Cấp 8)
-    1101004236, -- Lam Sư Đoạt Mệnh - M416 (Cấp 8)
-    1101004246, -- Hỏa Liên - M416 (Cấp 8)
-    1101004046, -- Băng giá - M416 (Cấp 7)
-    1101004062, -- Chú hề - M416 (Cấp 7)
-    1101004078, -- Kẻ lang thang - M416 (Cấp 7)
-    1101004086, -- Bò Sát Gầm Gừ - M416 (Cấp 7)
-    1101004098, -- Tiếng Gọi Hoang Dã - M416 (Cấp 7)
-    1101004138, -- Lõi Công Nghệ - M416 (Cấp 7)
-
-    -- [ AKM ]
-    1101001174, -- Bạo Chúa Bộ Lạc - AKM (Cấp 8)
-    1101001213, -- Đô Đốc Hải Long Tinh - AKM (Cấp 8)
-    1101001242, -- Ngày Phán Quyết - AKM (Cấp 8)
-    1101001265, -- Thời Quang Khả Biến - AKM (Cấp 8)
-    1101001276, -- Huyễn Thần - AKM (Cấp 8)
-    1101001063, -- Huyền thoại Seven Seas - AKM (Cấp 7)
-    1101001089, -- Băng giá - AKM (Cấp 7)
-    1101001103, -- Hóa Thạch - AKM (Cấp 7)
-    1101001116, -- Bí Ngô Kinh Dị - AKM (Cấp 7)
-    1101001128, -- Long Vương - AKM (Cấp 7)
-    1101001143, -- Hải Tặc Vàng - AKM (Cấp 7)
-    1101001154, -- Người Giải Mã - AKM (Cấp 7)
-    1101001231, -- Thỏ Tinh Nghịch - AKM (Cấp 7)
-    1101001249, -- Thánh Quang (Trăng Thần) - AKM (Cấp 7)
-    1101001256, -- Thánh Quang (Lông Vũ Hoàng Kim) - AKM (Cấp 7)
-    1101001042, -- Ánh kim - AKM (Cấp 6)
-    1101001068, -- Hổ gầm gừ - AKM (Cấp 5)
-    
-    -- súng M16A4
-    1101002156,
-    1101002149, -- Celadon Aether - M16A4 (Lv. 5)
-    1101002142, -- PUBG MOBILE × G-DRAGON - M16A4 (Lv. 5)
-    1101002133, -- Mechagodzilla - M16A4 (Lv. 5)
-    1101002125, -- Veldora - M16A4(Lv.5)
-    1101002110, -- Sweetheart Surge - M16A4 (Lv. 5)
-    1101002117, -- Seraphic Beacon - M16A4 (Lv. 5)
-    1101002103, -- Dracoguard - M16A4 (Lv. 5)
-    1101002081, -- Skeletal Core - M16A4 (Lv. 7)
-    1101002068, -- Radiant Edge - M16A4 (Lv. 5)
-    1101002056, -- Aurora Pulse - M16A4 (Lv. 7)
-    1101002029, -- Blood & Bones - M16A4 (Lv. 7)
-    
-    -- [ SCAR-L ]
-    1101003146, -- Gai Tà Ác - SCAR-L (Cấp 8)
-    1101003167, -- Ma Vương Huyết Hồn - SCAR-L (Cấp 8)
-    1101003227, -- Thiên Điểu - SCAR-L (Cấp 8)
-    1101003057, -- Súng nước - SCAR-L (Cấp 7)
-    1101003070, -- Bí Ngô Ma Quái - SCAR-L (Cấp 7)
-    1101003080, -- Chiến Dịch Vì Ngày Mai - SCAR-L (Cấp 7)
-    1101003099, -- Drop Da Bass - SCAR-L (Cấp 7)
-    1101003119, -- Tinh thể Hextech SCAR-L (Cấp 7)
-    1101003188, -- Cái Ôm Của Chú Hề - SCAR-L (Cấp 7)
-    1101003195, -- Thánh Nữ Huyền Ảo - SCAR-L (Cấp 7)
-    1101003208, -- Vương Quốc Huyền Ảo - SCAR-L (Cấp 7)
-    1101003219, -- Kính Pha Lê - SCAR-L (Cấp 7)
-    1101003173, -- Ánh Sáng Hoàng Tộc - SCAR-L (Cấp 5)
-    1101003212, -- Mèo Ăn Vặt - SCAR-L (Cấp 3)
-
-    -- [ M762 ]
-    1101008081, -- Vị Khách Nổi Loạn - M762 (Cấp 8)
-    1101008104, -- Lõi Sao Huyền Ảo - M762 (Cấp 8)
-    1101008146, -- Bạch Cốt U Minh - M762 (Cấp 8)
-    1101008154, -- Khung Xương - M762 (Cấp 8)
-    1101008051, -- Bản Nhạc Tình Yêu - M762 (Cấp 7)
-    1101008061, -- Phát Bắn Chí Mạng - M762 (Cấp 7)
-    1101008070, -- GACKT MOONSAGA - M762 (Cấp 7)
-    1101008116, -- Biểu Tượng Bóng Đá Messi - M762 (Cấp 7)
-    1101008126, -- Huyết Rồng - M762 (Cấp 7)
-    1101008136, -- Tiên Linh Lưu Ly - M762 (Cấp 7)
-    1101008163, -- Cổ Vật Hắc Ám - M762 (Cấp 7)
-    1101008026, -- Pony Bé Nhỏ - M762 (Cấp 5)
-    1101008036, -- Đóa Sen Phẫn Nộ - M762 (Cấp 5)
-
-    -- [ AUG ]
-    1101006062, -- Tinh Linh Băng Giá - AUG (Cấp 8)
-    1101006085, -- Hoa Hồng Ma Mị - AUG (Cấp 8)
-    1101006075, -- Hỏa Ca - AUG (Cấp 7)
-    1101006033, -- Gánh Xiếc Rong - AUG (Cấp 5)
-    1101006044, -- Evangelion Angel Thứ 4 - AUG (Cấp 5)
-    1101006067, -- Ác Mộng Biển Sâu - AUG (Cấp 5)
-
-    -- [ GROZA ]
-    1101005038, -- Ryomen Sukuna - Groza (Cấp 7)
-    1101005052, -- Lửa U Minh - Groza (Cấp 7)
-    1101005098, -- Godzilla Bốc Lửa - Groza (Cấp 7)
-    1101005019, -- Kỵ Binh Rừng Sâu - GROZA (Cấp 5)
-    1101005025, -- Đêm Huyền Ảo - GROZA (Cấp 5)
-    1101005043, -- Trận Chiến Sắc Màu - Groza (Cấp 5)
-    1101005082, -- Lồng Đèn Bí Ngô - Groza (Cấp 5)
-    1101005090, -- Di Tích Thượng Cổ - Groza (Cấp 5)
-    1101005105, -- Singam Roar - Groza (Cấp 5)
-
-    -- [ QBZ & Mk47 & G36C & Honey Badger & FAMAS & ASM Abakan & ACE32 ]
-    1101007046, -- Công Chúa Hắc Ám - QBZ (Cấp 7)
-    1101007062, -- Hoa Kiếm Chí Mạng - QBZ (Cấp 7)
-    1101007071, -- Thiên Mệnh - QBZ (Cấp 7)
-    1101007025, -- Ánh Dương - QBZ (Cấp 5)
-    1101007036, -- Càn Quét - QBZ (Cấp 5)
-    1101007079, -- Băng Quyền - QBZ (Cấp 5)
-    1101009019, -- Thỏ Tinh Quái - Mk47 (Cấp 3)
-    1101010029, -- Xung Nhịp Sân Cỏ - G36C (Cấp 5)
-    1101012033, -- Cổ Mộc Chiến Khí - Honey Badger (Cấp 7)
-    1101012009, -- Sắc Màu Huyền Ảo - Honey Badger (Cấp 5)
-    1101012018, -- Thanh Âm Du Dương - Honey Badger (Cấp 5)
-    1101012024, -- Honey Badger Mikey (Cấp 5)
-    1101100012, -- Đế Vương Thần Vực - FAMAS (Cấp 8)
-    1101100018, -- Ảo Ảnh Điện Tử - FAMAS (Cấp 5)
-    1101101007, -- Uy Vũ Hắc Điểu - ASM Abakan (Cấp 7)
-    1101102025, -- Thủy Quái - ACE32 (Cấp 8)
-    1101102041, -- Tiên Tri Điềm Lành - ACE32 (Cấp 8)
-    1101102049, -- Thì Thầm Cánh Bướm - ACE32 (Cấp 8)
-    1101102007, -- Kamehameha - ACE32 (Cấp 7)
-    1101102017, -- Ngọc Bích - ACE32 (Cấp 7)
-    1101102032, -- Cáo Tinh Nghịch - ACE32 (Cấp 5)
-
-    -- [ SMG (UZI, UMP45, Vector, Thompson, Bizon, MP5K, P90) ]
-    1102001120, -- Băng Giá - UZI (Cấp 8)
-    1102001130, -- Xiềng Xích Hỏa Ngục - UZI (Cấp 7)
-    1102001024, -- Savagery - UZI (Cấp 6)
-    1102001036, -- Vật Tổ Thần Bí - UZI (Cấp 5)
-    1102004048, -- Lilac Finesse - Thompson SMG (Lv. 3)
-    1102004034, -- Candy Cane - Thompson SMG (Lv. 5)
-    1102004018, -- Candy Cane - Thompson SMG (Lv. 5)    
-    1102001058, -- Khoảnh Khắc Bất Ngờ - UZI (Cấp 5)
-    1102001069, -- UZI Quang Hóa (Cấp 5)
-    1102001089, -- Ma Pháp - UZI (Cấp 5)
-    1102001103, -- Cam Tươi Mát - UZI (Cấp 5)
-    1102001102, -- Máy Ép Trái Cây - UZI (Cấp 5)
-    1102002438, -- Song Tử Chiến - UMP45 (Cấp 8)
-    1102002446, -- Song Tử Đỏ Thẫm - UMP45 (Cấp 8)
-    1102002043, -- Hỏa long - UMP45 (Cấp 7)
-    1102002061, -- Ảo Mộng Chết Chóc - UMP45 (Cấp 7)
-    1102002136, -- Băng Giá - UMP45 (Cấp 7)
-    1102002424, -- Thần Khí Anukhra - UMP45 (Cấp 7)
-    1102002053, -- EMP - UMP45 (Cấp 5)
-    1102002070, -- Đồ Tể Bạch Kim - UMP45 (Cấp 5)
-    1102002090, -- Cuộc Chiến 8-Bit - UMP45 (Cấp 5)
-    1102002112, -- Ngày Giáng Sinh - UMP45 (Cấp 5)
-    1102002117, -- Ong Bắp Cày - UMP45 (Cấp 5)
-    1102002129, -- Con Sóng Lễ Hội - UMP45 (Cấp 5)
-    1102002143, -- PUBGM X NewJeans - UMP45 (Cấp 5)
-    1102003080, -- Cánh Rồng - Vector (Cấp 7)
-    1102003100, -- Tuyết Diệt Ảnh - Vector (Cấp 7)
-    1102003020, -- Nanh Dơi Huyết Tộc - Vector (Cấp 5)
-    1102003031, -- Hoa Hồng Đêm - Vector (Cấp 5)
-    1102003039, -- Gấu Tinh Nghịch - Vector (Cấp 5)
-    1102003052, -- Bá Tước Vàng - Vector (Cấp 5)
-    1102003065, -- Lưỡi Liềm Vàng - Vector (Cấp 5)
-    1102003072, -- Sát Thủ Tối Thượng - Vector (Cấp 5)
-    1102003090, -- KMF Lancelot - Vector (Cấp 5)
-    1102004018, -- Kẹo ngọt - Thompson (Cấp 5)
-    1102004034, -- Máy Chạy Hơi Nước - Thompson (Cấp 5)
-    1102004048, -- Tử Đằng - Thompson SMG (Cấp 3)
-    1102005064, -- Quang Ảo Điện Tử - PP-19 Bizon (Cấp 7)
-    1102005007, -- Tắc Kè - PP-19 Bizon (Cấp 5)
-    1102005020, -- Skullcrusher - PP-19 Bizon (Cấp 5)
-    1102005041, -- Thần Binh Võ Thuật - PP-19 Bizon (Cấp 5)
-    1102005052, -- DP Quantum Quake - Bizon (Cấp 5)
-    1102005057, -- Lân Sư - PP-19 Bizon (Cấp 5)
-    1102005072, -- Huyết Tế - PP-19 Bizon (Cấp 5)
-    1102005078, -- SAKAMOTO SHOP - PP-19 (Cấp 5)
-    1102007019, -- PUBGM X QWER - MP5K (Cấp 5)
-    1102007022, -- Pixel Cổ Điển - MP5K (Cấp 3)
-    1102105012, -- Miêu Nữ Công Nghệ - P90 (Cấp 7)
-    1102105028, -- Thiên Mã - P90 (Cấp 7)
-    1102105018, -- Móng Vuốt Hoàng Kim - P90 (Cấp 5)
-
-    -- [ SNIPER & MARKSMAN RIFLE (Kar98, M24, AWM, SKS, SLR, Mk14, etc.) ]
-    1103001202, -- Băng Yêu - Kar98K (Cấp 8)
-    1103001060, -- Dấu nanh Phẫn nộ - Kar98K (Cấp 7)
-    1103001079, -- Kukulkan Cuồng Nộ - Kar98K (Cấp 7)
-    1103001101, -- Ánh Trăng - Kar98K (Cấp 7)
-    1103001129, -- Gackt Moon - Kar98K (Cấp 7)
-    1103001146, -- Cá Mập Titan - Kar98K (Cấp 7)
-    1103001154, -- Mật Mã Chết Chóc - Kar98K (Cấp 7)
-    1103001179, -- Điện Cực Tím - Kar98K (Cấp 7)
-    1103001191, -- Hồng Hỏa Diệm - Kar98K (Cấp 7)
-    1103001085, -- Đêm Nhạc Rock - Kar98K (Cấp 5)
-    1103001160, -- Thợ Săn Tinh Vân - Kar98K (Cấp 5)
-    1103001183, -- Nhịp Điệu Mèo Con - Kar98K (Cấp 3)
-    1103002030, -- Quyền Trượng Pharaoh - M24 (Cấp 7)
-    1103002059, -- Tuần Hoàn Sự Sống - M24 (Cấp 7)
-    1103002087, -- Nhịp Điệu Hoàn Mỹ - M24 (Cấp 7)
-    1103002106, -- Minh Nguyệt Cấm Vực - M24 (Cấp 7)
-    1103002156, -- Bình Minh Bóng Tối - M24 (Cấp 7)
-    1103002049, -- Hồ Điệp Phu Nhân - M24 (Cấp 5)
-    1103002047, -- Giai Điệu Chí Mạng - M24 (Cấp 5)
-    1103002094, -- Công Nghệ Cao - M24 (Cấp 5)
-    1103003022, -- Neon - AWM (Cấp 7)
-    1103003030, -- Chỉ Huy Chiến Trường - AWM (Cấp 7)
-    1103003042, -- Godzilla - AWM (Cấp 7)
-    1103003051, -- Đại Long Cầu Vồng - AWM (Cấp 7)
-    1103003062, -- Hỏa Phượng Hoàng - AWM (Cấp 7)
-    1103003079, -- Huyết Hải Thiên Long - AWM (Cấp 7)
-    1103003087, -- Thanh Hoa Xà - AWM (Cấp 7)
-    1103003099, -- Hắc Khí - AWM (Cấp 7)
-    1103003092, -- Hồng Hoang - AWM (Cấp 5)
-    1103004037, -- Quý Bà Đỏ - SKS (Cấp 7)
-    1103004046, -- Rừng Thép - SKS (Cấp 5)
-    1103004058, -- Năng Lượng Băng Tuyết - SKS (Cấp 5)
-    1103004080, -- Khiết Hoa Nở Rộ - SKS (Cấp 5)
-    1103004087, -- Giai Điệu Tử Thần - SKS (Cấp 5)
-    1103005024, -- Quạ Đen - VSS (Cấp 5)
-    1103005048, -- Trinh Sát Tuyết Trắng - VSS (Cấp 3)
-    1103009022, -- Mùa Hoa Đào - SLR (Cấp 5)
-    1103009037, -- Ngọn Lửa Ma Thuật - SLR (Cấp 5)
-    1103009051, -- Ma Mộng - SLR (Cấp 5)
-    1103009042, -- Thanh Âm Hải Huyền - SLR (Cấp 3)
-    1103006030, -- Sông Băng - Mini14 (Cấp 7)
-    1103006046, -- Nét Đẹp Thuần Khiết - Mini14 (Cấp 5)
-    1103006058, -- Mèo Chiêu Tài - Mini14 (Cấp 5)
-    1103006063, -- Tay Đua Gan Dạ - Mini14 (Cấp 5)
-    1103006075, -- Nhịp Chiến Nhanh - Mini14 (Cấp 5)
-    1103007028, -- Vương Quốc Rồng - Mk14 (Cấp 8)
-    1103007020, -- Sức Mạnh Ngân Hà - Mk14 (Cấp 5)
-    1103007038, -- Rồng Sữa Mềm Mại - Mk14 (Cấp 5)
-    1103007043, -- Hộp Quà May Mắn - Mk14 (Cấp 5)
-    1103012010, -- Khủng Long Ephialtes - AMR (Cấp 8)
-    1103012019, -- Hỏa Thần - AMR (Cấp 7)
-    1103012031, -- Vô Âm Ly Biệt - AMR (Cấp 7)
-    1103012039, -- Đại Chiến Huyễn Sắc - AMR (Cấp 7)
-    1103012024, -- Tinh Thể Onyx - AMR (Cấp 5)
-    1103100007, -- Thú Săn Mồi - Mk12 (Cấp 5)
-    1103102007, -- Chiến Hạm Vũ Trụ - DSR (Cấp 7)
-    1103103007, -- Vinh Quang Chiến Binh - M1 Garand (Cấp 7)
-
-    -- [ SHOTGUN & MACHINE GUN (S12K, DBS, M249, DP-28, MG3...) ]
-    1104001035, -- Độc Hồn - S686 (Cấp 5)
-    1104002022, -- Chạng Vạng - S1897 (Cấp 5)
-    1104002049, -- Xung Kích Sắc Màu - S1897 (Cấp 3)
-    1104003026, -- S12K GACKT (Cấp 7)
-    1104003037, -- Kích Hoạt Nguyên Tử - S12K (Cấp 5)
-    1104003046, -- Trái Tim Cyber - S12K (Cấp 5)
-    1104004035, -- Chiến Giáp Quái Thú - DBS (Cấp 5)
-    1104004041, -- Sandsinger - DBS (Cấp 5)
-    1104004051, -- Okarun - DBS (Cấp 5)
-    1104004024, -- Báo Sắc Màu - DBS (Cấp 3)
-    1104102004, -- Tàn Tích Hoàng Kim - NS2000 (Cấp 3)
-    1105001034, -- Pháo Giáng Sinh - M249 (Cấp 7)
-    1105001048, -- Nữ Đế Ánh Sáng - M249 (Cấp 7)
-    1105001069, -- Vương Quyền Hắc Ám - M249 (Cấp 7)
-    1105001020, -- Nữ Hoàng Băng Giá M249 V (Cấp 5)
-    1105001054, -- Stargaze Fury - M249 (Cấp 5)
-    1105001062, -- Graffiti Đường Phố - M249 (Cấp 5)
-    1105001075, -- Cá Mập Thép - M249 (Cấp 4)
-    1105002091, -- Huyết Họa - DP28 (Cấp 8)
-    1105002018, -- Sát Thủ Bí Ẩn - DP-28 (Cấp 5)
-    1105002035, -- Ngọc Long - DP-28 (Cấp 5)
-    1105002058, -- Chiến Binh Hàng Hải - DP28 (Cấp 5)
-    1105002063, -- Rồng Thần Shenron - DP-28 (Cấp 5)
-    1105002071, -- Chiến Sĩ Thần Giáp - DP-28 (Cấp 5)
-    1105002076, -- Mèo Số Hóa - DP-28 (Cấp 5)
-    1105002083, -- DP-28 Frieren's Staff (Cấp 5)
-    1105002096, -- Hồ Tộc - DP-28 (Cấp 3)
-    1105010019, -- Chiến Thần Bầu Trời - MG3 (Cấp 7)
-    1105010008, -- Thiên Khung - MG3 (Cấp 5)
-    1105010026, -- Mina Ashiro - MG3 (Cấp 5)
-
-    -- [ CẬN CHIẾN & VŨ KHÍ KHÁC (Skorpion, Nỏ, Chảo, Dao...) ]
-    1106008013, -- Mật Mã Vàng - Skorpion (Cấp 5)
-    1106008022, -- Bí Ẩn Tinh Tú - Skorpion (Cấp 3)
-    1106011008, -- Rồng Rắn Lên Mây - MP7 Kép (Cấp 5)
-    1106011003, -- Thợ Săn Kẹo - MP7 (Cấp 3)
-    1107001018, -- Chúa Hề Thịnh Nộ - Nỏ (Cấp 3)
-    1107098003, -- Rung Chấn Công Nghệ - MGL (Cấp 3)
-    1108001057, -- Săn Rồng - Dao (Cấp 3)
-    1108001064, -- Đoản Kiếm Yor SPY×FAMILY (Cấp 3)
-    1108001069, -- Ki Sword (Cấp 3)
-    1108001081, -- Rìu Godzilla Bốc Lửa (Cấp 3)
-    1108001085, -- Kiếm Trung Đoàn Trinh Sát Cấp 3
-    1108001098, -- Thương Đảo Ngược Thiên Đường - Dao (Cấp 3)
-    1108001104, -- Xích Tay - Dao (Cấp 3)
-    1108002059, -- Đinh Ba Thủy Triều Thịnh Nộ (Cấp 5)
-    1108004125, -- Hũ Mật Ong - Chảo (Cấp 5)
-    1108004160, -- Cá Sấu - Chảo (Cấp 5)
-    1108004145, -- Đêm Nhạc Rock - Chảo (Cấp 5)
-    1108004283, -- Vinh Quang - Chảo (Cấp 6)
-    1108004337, -- Chảo Điện Nguyên Tử (Cấp 6)
-    1108004356, -- Gà Rán - Chảo (Cấp 3)
-    1108004365, -- Yokai Huyền Bí - Chảo (Cấp 3)
-    1108004377, -- Chảo Cánh Cụt Vui Vẻ (Cấp 5)
-    1108004416, -- Quạt Vũ Điệu Nóng Bỏng - Chảo (Cấp 3)
-    1108005050, -- Rồng Băng Giá - Dao Găm (Cấp 3)
-
-    -- ==============================================================================
-    -- 2. FULL SIÊU XE (VIP VEHICLES)
-    -- ==============================================================================
-    -- [ McLaren ]
-    1961007, -- McLaren 570S (Đen)
-    1961010, -- McLaren 570S (Trắng)
-    1961012, -- McLaren 570S (Hồng)
-    1961013, -- McLaren 570S (Vàng Trắng)
-    1961014, -- McLaren 570S (Vàng Đen)
-    1961015, -- McLaren 570S (Ánh Kim)
-    1961147, -- McLaren P1 (Trời Sao)
-    1961148, -- McLaren P1 (Hồng Rực Rỡ)
-    1961149, -- McLaren P1 (Vàng Núi Lửa)
-    1907054, -- Xe Đua Đội McLaren F1 (Điện Tử)
-    1907058, -- Xe Đua Đội McLaren F1
-    1907059, -- Xe Đua Đội McLaren F1 (Chiến Thắng)
-
-    -- [ Koenigsegg ]
-    1961016, -- Koenigsegg Jesko (Xám Bạc)
-    1961017, -- Koenigsegg Jesko (Cầu Vồng)
-    1961018, -- Koenigsegg Jesko (Bình Minh)
-    1961029, -- Koenigsegg One:1 Gilt
-    1961030, -- Koenigsegg One:1 Cyber Nebula
-    1961031, -- Koenigsegg One:1 Jade
-    1961032, -- Koenigsegg One:1 Phoenix
-    1903074, -- Koenigsegg Gemera (Xám Bạc)
-    1903075, -- Koenigsegg Gemera (Cầu Vồng)
-    1903076, -- Koenigsegg Gemera (Bình Minh)
-
-    -- [ Lamborghini ]
-    1961020, -- Lamborghini Aventador SVJ Verde Alceo
-    1961021, -- Lamborghini Centenario Galassia
-    1961024, -- Lamborghini Aventador SVJ Blue
-    1961025, -- Lamborghini Centenario Carbon Fiber
-    1961144, -- Lamborghini Invencible Rosso Efesto
-    1961145, -- Lamborghini Invencible Nebula Drift
-    1903079, -- Lamborghini Estoque Oro
-    1903080, -- Lamborghini Estoque Metal Grey
-    1908066, -- Lamborghini Urus Pink
-    1908067, -- Lamborghini Urus Giallo Inti
-
-    -- [ Bugatti ]
-    1961041, -- Bugatti Veyron 16.4 (Sắc Màu)
-    1961042, -- Bugatti Veyron 16.4 (Vàng)
-    1961043, -- Bugatti Veyron 16.4
-    1915099,
-    1961044, -- Bugatti La Voiture Noire
-    1961045, -- Bugatti La Voiture Noire (Hợp Kim)
-    1961046, -- Bugatti La Voiture Noire (Chiến Binh)
-    1961047, -- Bugatti La Voiture Noire (Tinh Vân)
-    1961151, -- Bugatti Bolide (Lưỡi Gương)
-    1961152, -- Bugatti Bolide (Bỉ Ngạn)
-    1915017,
-    1915018,
-    1961153, -- Bugatti Bolide (Ảo Ảnh Hồ Băng)
-    
-    -- [ Aston Martin ]
-    1961048, -- Aston Martin Valkyrie (Luminous Diamond)
-    1961049, -- Aston Martin Valkyrie (Racing Green)
-    1915005, -- Aston Martin DBS Volante (Deep Cosmos)
-    1915006, -- Aston Martin DBS Volante (Celestial Pink)
-    1915007, -- Aston Martin DBS Volante (Black-Bronze Satin)
-    1908084, -- Aston Martin DBX707 (Neon Purple)
-    1908085, -- Aston Martin DBX707 (Quasar Blue)
-
-    -- [ Pagani ]
-    1961051, -- Pagani Zonda R (Tricolore Carbon)
-    1961052, -- Pagani Zonda R (Bianco Benny)
-    1961053, -- Pagani Zonda R (Melodic Midnight)
-    1961054, -- Pagani Imola (Grigio Montecarlo)
-    1961055, -- Pagani Imola (Crystal Clear Carbon)
-    1961056, -- Pagani Imola (Nebula Dream)
-    1961057, -- Pagani Imola (Arctic Aegis)
-
-    -- [ Bentley ]
-    1961137, -- Bentley Batur (Kim Cương Lấp Lánh)
-    1961138, -- Bentley Batur (Tận Cùng Thời Gian)
-    1961139, -- Bentley Betayga Azure (Vương Quốc Huyền Ảo)
-    1903200, -- Bentley Flying Spur Mulliner (Tinh Vân Xanh)
-    1903201, -- Bentley Flying Spur Mulliner (Dòng Chảy Vịnh Hẹp)
-    1908094, -- Bentley Betayga Azure (Mưa Hoa)
-    1908095, -- Bentley Betayga Azure (Đêm Yên Tĩnh)
-    1915008, -- Bentley Continental GTC Mulliner (Mộng Cảnh Lung Linh)
-    1915009, -- Bentley Continental GTC Mulliner (Quý Tộc Áo Tím)
-
-    -- [ Maserati ]
-    1961038, -- Maserati MC20 Bianco Audace
-    1961039, -- Maserati MC20 Rosso Vincente
-    1961040, -- Maserati MC20 Sogni
-    1908075, -- Maserati Levante Blu Emozione
-    1908076, -- Maserati Luce Arancione
-    1908077, -- Maserati Levante Neon Urbano
-    1908078, -- Maserati Levante Firmamento
-
-    -- [ Dodge / SRT ]
-    1961036, -- Dodge Challenger SRT Hellcat - Blaze
-    1961037, -- Dodge Challenger SRT Hellcat - Lime
-    1961050, -- Dodge Challenger SRT Hellcat Jailbreak - Hellfire
-    1961136, -- Dodge Challenger SRT Hellcat - Blaze
-    1961150, -- Dodge Challenger SRT Hellcat Jailbreak - Hellfire
-    1903088, -- Dodge Charger SRT Hellcat - Fuchsia
-    1903089, -- Dodge Charger SRT Hellcat - Tuscan Torque
-    1903090, -- Dodge Charger SRT Hellcat Jailbreak - Violet Venom
-    1903189, -- Dodge Charger SRT Hellcat - Tuscan Torque
-    1903190, -- Dodge Charger SRT Hellcat Jailbreak - Violet Venom
-    1908086, -- Dodge Hornet - Scarlet Sting
-    1908088, -- Dodge Hornet GLH Concept - Redline
-    1908089, -- Dodge Hornet - Sunburst
-    1908188, -- Dodge Hornet GLH Concept - Redline
-    1908189, -- Dodge Hornet - Sunburst
-
-    -- [ Porsche ]
-    1961062, -- Porsche 918 Spyder (Dòng Nước)
-    1961063, -- Porsche 918 Spyder (964 Bạc Ánh Kim)
-    1961064, -- Porsche 918 Spyder (Hồng)
-    1903218, -- Porsche Panamera Turbo S (Lam Ngọc)
-    1903219, -- Porsche Panamera Turbo S (Xanh Viper)
-    1908108, -- Porsche Cayenne Turbo GT (Đường Đua Rực Lửa)
-    1908109, -- Porsche Cayenne Turbo GT (Cam Dung Nham)
-    1915021, -- Porsche 911 Carrera 4 GTS Cabriolet (Ngàn Sao)
-    1915022, -- Porsche 911 Carrera 4 GTS Cabriolet (Đỏ Ruby)
-
-    -- [ Shelby / Ford ]
-    1961058, -- Shelby 427 Cobra (Xanh & Trắng)
-    1961059, -- Shelby 427 Cobra (Graffiti Phục Cổ)
-    1903210, -- Shelby GT500 (Đen & Đỏ)
-    1903211, -- Shelby GT500 (Người Ngoài Hành Tinh Cyber)
-    1961068, -- Ford Mustang GTD (Huyền Thoại Xanh Tươi)
-    1961069, -- Ford Mustang GTD (Tinh Thần Nước Mỹ)
-
-    -- [ Lotus ]
-    1961060, -- Lotus Emira (Rừng Sâu Thẫm)
-    1961061, -- Lotus Emira (Lướt Sắc Xanh)
-
-    -- [ Apollo ]
-    1961065, -- Apollo EVO (Vàng Rực Rỡ)
-    1961066, -- Apollo EVO (Hoàng Hôn)
-    1961067, -- Apollo EVO (Băng Giá)
-    1903220, -- Apollo Intensa Emozione (Hỏa Ngục Nóng Chảy)
-    1903221, -- Apollo Intensa Emozione (Bóng Ma Tím)
-    1903222, -- Apollo Intensa Emozione (Quyết Đấu)
-    1903223, -- Apollo Intensa Emozione (Bão Tố)
-
-    -- [ SSC Tuatara ]
-    1961140, -- Ảo Ảnh Hoa Hồng SSC Tuatara
-    1961141, -- Hạc Trời SSC Tuatara
-    1961142, -- Đao Bình Minh SSC Tuatara Striker
-    1961143, -- Màn Đêm Xanh SSC Tuatara Striker
-
-    -- [ Tesla ]
-    1903071, -- Tesla Roadster (Kim Cương)
-    1903072, -- Tesla Roadster (Pha Lê Tím)
-    1903073, -- Tesla Roadster (Xanh Biển Cả)
-
-    -- [ Ducati / Motor VIP ]
-    1901028, -- Daryls Motorcycle
-    1901076, -- Ducati Panigale V4S Swift Mirage
-    1901075, -- Ducati Panigale V4S Crimson Storm
-    1901074, -- Ducati Panigale V4S Black Phantom
-    1901073, -- DUCATI Panigale V4S  
-    1901018, -- Skeleton Chariot (Lv. 3)    
-    1901027, -- Roaring Tiger Motorcycle (Lv. 3)
-    1901047, -- Phantom Motorcycle (Lv. 7)
-    1901066, -- Evangelion Mark.06 Motorcycle
-    1901089, -- Cosmic Jump Motorcycle (Lv. 4)
-    1901092, -- Indian FTR R Carbon
-    1901093, -- Indian Scout 101
-    1901108, -- CVO™ Road Glide® ST (Limited)
-    1901070, -- Nether Visage 2-Seat Motorcycle
-    1901090, -- Night Ember 2-Seat Motorcycle
-
-    -- ==============================================================================
-    -- 3. FULL BAY DÙ (DÙ RƠI, TÀU LƯỢN, VÁN TRƯỢT BAY)
-    -- ==============================================================================
-    -- [ DÙ (Parachutes) ]
-    1401000, -- New Years Blessing Parachute
-    1401001, -- Happy New Year Parachute
-    1401002, -- Dù Xương Đỏ
-    1401003, -- Dù tiểu quỷ tinh nghịch
-    1401005, -- Dù nhện biến hình
-    1401006, -- Dù Mùa 5
-    1401007, -- Dù sinh nhật
-    1401008, -- Dù Sếu Vàng
-    1401009, -- Dù Quỷ Đỏ
-    1401010, -- Dù hoa bách thảo
-    1401011, -- Dù anh đào
-    1401012, -- Dù Campus Tournament
-    1401013, -- Dù Joker
-    1401014, -- Dù chú hề
-    1401015, -- Carabao Parachute
-    1401016, -- Orange Life Parachute
-    1401017, -- Dù ưng vàng
-    1401018, -- Dù Quán quân Mùa 8
-    1401019, -- Dù Đội trưởng Ryan
-    1401020, -- Dù kẻ lang thang
-    1401021, -- Dù cung trăng
-    1401022, -- OPPO F11 PRO SURVIVOURS PARACHUTE
-    1401023, -- Dù lãnh chúa Sekigahara (Vuông)
-    1401024, -- Dù Đồng Minh Loot Thính
-    1401025, -- Dù Đêm Mê Hoặc (Vuông)
-    1401026, -- Dù cát tường
-    1401027, -- Dù PMCO
-    1401028, -- Dù Quán quân Mùa 7
-    1401029, -- Dù sinh nhật rực rỡ
-    1401031, -- Dù Quán quân Mùa 6
-    1401032, -- Dù Dao Găm Đỏ
-    1401033, -- Dù WALKER
-    1401034, -- Dù Phù Thủy Băng Giá
-    1401035, -- Dù người thách đấu
-    1401036, -- Dù BAPE X PUBGM CAMO
-    1401037, -- Dù Godzilla (Trắng)
-    1401038, -- Dù Godzilla (Vàng)
-    1401039, -- Dù Godzilla (Xanh)
-    1401040, -- Dù Monarch
-    1401041, -- Dù Cà Ri
-    1401043, -- Dù Người Gác Đêm
-    1401044, -- Dù hoa hồng đen
-    1401045, -- Dù Mèo May Mắn
-    1401046, -- Dù Đêm u ám
-    1401047, -- Dù Cá Voi Sát Thủ
-    1401048, -- Dù thủy quái Kraken
-    1401050, -- Dù giai điệu âm nhạc
-    1401051, -- Dù OPPO Reno
-    1401052, -- Dù OPPO VOOC
-    1401053, -- Dù Đêm Mê Hoặc
-    1401054, -- Dù Chú Heo Tinh Nghịch
-    1401055, -- Dù Red (Dài)
-    1401056, -- PMJC Parachute
-    1401057, -- PMSC Parachute
-    1401059, -- Dù Quán quân Draconian
-    1401060, -- Dù lãnh chúa Sekigahara
-    1401061, -- Dù Tiểu Quỷ
-    1401062, -- Dù Quán quân Mùa 9
-    1401063, -- Dù Quán quân Mùa 10
-    1401064, -- Dù Mèo Đen
-    1401065, -- Dù Gà trống
-    1401066, -- Dù Mọt Sách Băng Giá
-    1401067, -- Dù Người Giảm Đau #11
-    1401068, -- Super Power Parachute
-    1401071, -- Dù Luân Hồi Vô Tận
-    1401072, -- Dù Chúa Tể Muôn Loài
-    1401074, -- Dù Bí Ngô Kinh Dị
-    1401085, -- Dù Gà Thơm Ngon
-    1401086, -- Dù Quán quân Mùa 11
-    1401087, -- Dù Hoa Sen Máu
-    1401088, -- Dù Hành Tinh Trôi Dạt
-    1401089, -- Dù Quán Quân Mùa 12
-    1401090, -- Dù Ninja Sát Thủ
-    1401091, -- Dù Neko Sakura
-    1401092, -- Dù Người Tiên Phong
-    1401094, -- Dù Fantasy Girl
-    1401095, -- Dù Tranh Vẽ Chiến Trường
-    1401096, -- Dù Người Phán Quyết
-    1401097, -- Dù Africa Pride
-    1401098, -- Dù Africa Unite
-    1401100, -- Dù Cậu Vàng
-    1401102, -- Dù đặc vụ PMSC World Cup
-    1401103, -- Dù Quân Đoàn Thất Lạc
-    1401104, -- Dù Giải Đấu PMCO
-    1401106, -- Dù Trung Úy Vũ Trụ
-    1401107, -- Dù Đầy Tớ Huyết Nha
-    1401108, -- Dù Street Dancer 3
-    1401109, -- Dù Unique KingCard
-    1401111, -- Dù Bánh Ú
-    1401112, -- Dù Gào Thét
-    1401113, -- Dù Thủ Vệ Tự Do
-    1401115, -- Dù Kẹo Ngọt
-    1401117, -- Dù Cao Bồi Viễn Tây
-    1401119, -- Dù Giáp Samurai
-    1401122, -- Incredible Parachute
-    1401124, -- Dù Warrior
-    1401125, -- Dù Quý Cô Gothic
-    1401127, -- Dù Thần Thoại Ả Rập
-    1401128, -- Dù Nhà Vô Địch Arena
-    1401129, -- Dù Quán Quân Mùa 13
-    1401130, -- Dù Gorilla
-    1401131, -- Dù PMGC
-    1401133, -- Dù Mùa 15
-    1401134, -- Dù Tulip
-    1401135, -- Dù Ác Ma Cuồng Nộ
-    1401137, -- Dù Mùa 14
-    1401138, -- Dù Pro League (Vàng)
-    1401139, -- Dù Pro League (Bạc)
-    1401140, -- Dù Lạc Đà Bảnh Bao
-    1401141, -- Dù Gà Rán
-    1401142, -- Dù CLB Hoàng Gia
-    1401145, -- Dù Bảy Sắc
-    1401146, -- Dù Mountain Dew
-    1401147, -- Dù Tư Tế Tối Cao
-    1401148, -- Dù Idol
-    1401149, -- Dù Dang Rộng Đôi Cánh
-    1401150, -- Dù Chiến Binh Thép
-    1401151, -- Dù Quán Quân Mùa 16
-    1401152, -- Dù Liềm Tử Thần
-    1401153, -- Dù emoji Thỏa Mãn
-    1401154, -- Dù emoji
-    1401155, -- Dù emoji Vui Nhộn
-    1401156, -- Dù Qualcomm
-    1401157, -- Dù Điểm Sơ Tán
-    1401159, -- Dù Lãnh Chúa Độc Tài
-    1401160, -- Dù Kẹp Hạt Dẻ Vui Vẻ
-    1401161, -- Dù Long Vương
-    1401163, -- Dù Giáp Chiến Thần
-    1401164, -- Dù Giai Điệu Yêu Thương
-    1401165, -- Dù Quán Quân Mùa 17
-    1401167, -- Dù Ánh Trăng Huyền Bí
-    1401168, -- Dù Tiệc Disco
-    1401169, -- Dù Quán Quân Mùa 18
-    1401170, -- Dù Tuyết Anh Đào
-    1401171, -- Dù Tổ Ong
-    1401174, -- Dù Quán Quân Mùa 19
-    1401177, -- Dù Quán Quân C1S1
-    1401178, -- Dù Băng Cát Sét
-    1401179, -- Dù El Diablo
-    1401181, -- Chúa Tể Băng Giá - Dù
-    1401182, -- Dù Kẻ Săn Mồi Biển Xanh
-    1401183, -- Dù Mộng Điệp
-    1401184, -- Dù Bọ Cánh Cứng
-    1401186, -- Dù Rùa và Thỏ
-    1401187, -- Dù Nhịp Bước Mạnh Mẽ
-    1401188, -- Dù PMPL Mùa Xuân 2021
-    1401189, -- Dù GodzillaVsKong
-    1401190, -- Dù Hành Trình Kỳ Diệu
-    1401191, -- Dù Dấu Ấn Vũ Trụ
-    1401192, -- Dù Đầu Bếp Gà
-    1401193, -- Dù Nghệ Thuật Sắc Màu
-    1401194, -- Dù Aerial Punk Rich Brian
-    1401195, -- Dù OPPO
-    1401196, -- Dù BUG
-    1401197, -- Dù Chúa Tể Bánh Răng
-    1401198, -- Dù Xiaomi
-    1401200, -- Dù Đôi Mắt Biển Sâu
-    1401201, -- Dù OnePlus
-    1401204, -- Dù foodpanda
-    1401205, -- Dù PMPL Mùa Thu 2021
-    1401208, -- Dù Thành Phố Trên Không
-    1401209, -- Dù Bóng Ma Tương Lai
-    1401210, -- Dù Mật Thám Cơ Khí
-    1401212, -- Dù Thành Phố Sắc Màu
-    1401213, -- Dù Súng Hoa Hồng
-    1401215, -- Dù Băng Giá
-    1401216, -- Dù Bản Đồ Kho Báu
-    1401217, -- Dù Cơn Sốt Giáng Sinh
-    1401218, -- Dù Họa Tiết Vàng
-    1401219, -- Dù Vương Quốc Vàng
-    1401220, -- Dù Hoàng Hôn Rực Rỡ
-    1401221, -- Dù Bồ Câu Trắng
-    1401222, -- Dù Vòng Xoay Thời Gian
-    1401223, -- Dù Zong
-    1401224, -- Dù Quán Quân C1S2
-    1401225, -- Dù Quán Quân C1S3
-    1401227, -- Dù Đại Hạ Giá
-    1401228, -- Dù Lãng Khách Thời Thượng
-    1401231, -- Dù PMGC 2021
-    1401232, -- Dù Liverpool FC
-    1401233, -- Dù Đột Phá
-    1401234, -- Dù Voi Sắc Màu
-    1401235, -- Dù Hợp Tác Egor Kreed
-    1401236, -- Gackt Moon Parachute
-    1401237, -- Dù Dune
-    1401238, -- Dù Guruh Gundala
-    1401239, -- Dù C2S4
-    1401240, -- Dù Baby Shark
-    1401241, -- Dù JAPAN LEAGUE S2
-    1401242, -- Dù Đầu Bếp Quái Thú
-    1401243, -- Dù Bá Chủ Đại Dương
-    1401244, -- Dù C2S5
-    1401245, -- Dù Nữ Hoàng Điện Tử
-    1401246, -- Dù Nhâm Dần
-    1401247, -- Dù Sắc Xuân
-    1401248, -- Dù Jujutsu Kaisen
-    1401249, -- Dù Shiba Inu
-    1401250, -- Dù Motorola
-    1401252, -- Dù Trận Chiến Trendy
-    1401254, -- Dù DJ Cá Tính
-    1401255, -- Dù Chị Chị Em Em
-    1401256, -- Dù Graffiti Neon
-    1401257, -- Dù C2S6
-    1401258, -- Dù Người Nhện: Không Còn Nhà
-    1401259, -- Dù Sát Thủ Thời Không
-    1401260, -- Dù Vùng Đất Hoang
-    1401261, -- Dù Sắc Màu
-    1401262, -- Dù Lễ Hội Sắc Màu
-    1401263, -- Dù Rạp Xiếc Thần Kỳ
-    1401264, -- Dù Thiếu Nữ Tóc Đỏ
-    1401265, -- Dù Bộ Đôi Hoàn Hảo
-    1401266, -- Dù Thiếu Nữ Song Sinh
-    1401267, -- Dù Cánh Cổng Kỳ Dị
-    1401268, -- Dù Thiếu Nữ Anime
-    1401269, -- Dù Gà Chiến Đấu
-    1401270, -- Dù Nến Xanh
-    1401271, -- Dù Hồn Ma Nghịch Ngợm
-    1401272, -- Dù Thiếu Nữ Cầu Nguyện
-    1401273, -- Dù Ma Nữ Đáng Yêu
-    1401274, -- Dù Evangelion NERV
-    1401275, -- Dù Chị Em Song Sinh
-    1401276, -- Dù PMPL Mùa Xuân 2022
-    1401277, -- Dù Gấu Teddy GB
-    1401278, -- Dù Sư Tử Thời Trang
-    1401280, -- Dù Kỷ Niệm Tuổi Thơ
-    1401281, -- Dù C3S7
-    1401282, -- Dù Mèo Khổng Lồ
-    1401283, -- Dù Butterfinger
-    1401284, -- Siêu Dù Nhảy
-    1401285, -- Dù Đồng Minh Mùa Hè
-    1401286, -- Dù Sóc Chuột
-    1401287, -- Dù Hỏa Diệm Ma Giáp
-    1401289, -- Dù Heartrocker
-    1401290, -- Dù Sư Tử Lưỡng Hà
-    1401291, -- Dù realme
-    1401292, -- Dù Lil Burger
-    1401294, -- Dù Dòng Sông Mộng Mơ
-    1401295, -- Dù C3S8
-    1401296, -- Dù Đêm Của Phép Màu
-    1401298, -- Dù Vinh Quang
-    1401299, -- Dù Bản Đồ Sao
-    1401300, -- Dù Chúa Tể Gai Độc
-    1401301, -- Dù Bóng Ma Và Nàng
-    1401302, -- Dù Gai Bé Bỏng
-    1401303, -- Dù Uqabi
-    1401308, -- Dù Phù Thủy Băng Giá
-    1401309, -- Dù Tốc Độ Cực Hạn
-    1401310, -- Dù PMWI 2022
-    1401311, -- BGMI Esports Parachute
-    1401312, -- PMJL SEASON3 Parachute
-    1401313, -- PMPS 2022 Parachute
-    1401314, -- Dù Chiến Binh Ngưu
-    1401315, -- Dù Quyền Lực Tối Thượng
-    1401316, -- Dù Đội Bóng Ả Rập
-    1401317, -- Dù Ngàn Sao Rực Rỡ
-    1401318, -- Dù Pháp Sư Thiên Văn
-    1401319, -- Dù C3S9
-    1401320, -- Dù BoBoiBoy
-    1401323, -- Dù Đường Đua Hoang Dã
-    1401324, -- Dù Tuần Lộc Trắng
-    1401325, -- Dù Rìu Hoàng Kim
-    1401326, -- Dù Vàng Huyền Bí
-    1401330, -- Dù Du Hành Tinh Vân
-    1401332, -- Dù Mèo Tuyết
-    1401334, -- Dù KFC
-    1401335, -- Dù Thủy Sư Cuồng Nộ
-    1401336, -- Dù Sọ Nham Thạch
-    1401337, -- Dù Bá Chủ Bầu Trời
-    1401338, -- Dù Grubhub
-    1401339, -- Dù AFA
-    1401340, -- Dù Huyền Thoại Siêu Sao Messi
-    1401343, -- Dù PMGC 2022
-    1401345, -- Dù Bản Đồ Kho Báu
-    1401346, -- Dù Nobru
-    1401347, -- Dù Sony
-    1401349, -- Dù Đột Kích Trên Không
-    1401351, -- Dù Nữ Hiệp
-    1401353, -- Dù Chú Hề Quỷ Quyệt
-    1401355, -- Dù Lý Tiểu Long
-    1401356, -- Dù Cặp Đôi Diễn Võ
-    1401357, -- Dù Donkey King
-    1401360, -- Dù Pro League
-    1401361, -- Dù Kế Hoạch Đỏ Thẫm
-    1401362, -- Dù C4S11
-    1401363, -- Dù Bản Đồ Vũ Trụ
-    1401364, -- Dù BE@RBRICK
-    1401365, -- Dù Nguồn Sáng Vinh Quang
-    1401366, -- Dù Ký Ức Xưa
-    1401367, -- Dù Bugatti
-    1401368, -- Dù Hóa Thạch Khủng Long
-    1401369, -- Dù Trốn Thoát T-Rex
-    1401370, -- Dù Dragon Ball Super
-    1401371, -- Dù C4S12
-    1401372, -- Dù Huyết Rồng
-    1401373, -- UNIVERSTAR BT21 Parachute
-    1401374, -- Dù HUAWEI AppGallery
-    1401375, -- Dù PMWI 2023
-    1401376, -- Dù C5S13
-    1401377, -- Dù Thỏ Disco
-    1401378, -- Dù Aston Martin
-    1401379, -- Dù Mùa Hè Trên Bãi Biển
-    1401380, -- Dù C5S14
-    1401381, -- Dù C5S15
-    1401382, -- Dù PMGC 2023
-    1401383, -- Dù KFC
-    1401385, -- Dù Yeti Khổng Lồ
-    1401386, -- Dù Pagani
-    1401387, -- Dù Báo Sắc Màu
-    1401388, -- Dù Bé Sóc Đáng Yêu
-    1401389, -- Dù Kỳ Giông Hồng
-    1401390, -- RS Swagster Parachute
-    1401391, -- Dù Gấu Trúc Ngọt Ngào
-    1401392, -- Dù Chiến Binh Hoa Hồng
-    1401393, -- Dù Cuộc Chiến Chính Nghĩa
-    1401394, -- Dù LINE FRIENDS
-    1401395, -- Dù Hồ Ly Thần Bí
-    1401396, -- Dù Zanmang Loopy
-    1401397, -- Hardik Sky Parachute
-    1401398, -- Dù C6S16
-    1401399, -- Dù Bóng Ma Quyến Rũ
-    1401400, -- Dù Bảo Hộ Hoàng Gia
-    1401401, -- Dù Bentley
-    1401402, -- SPY×FAMILY Dù
-    1401403, -- Dù Nhật Thực
-    1401404, -- Dù Chiến Sĩ Thần Giáp
-    1401405, -- Dù C6S17
-    1401406, -- Dù Giai Điệu Mèo Con
-    1401407, -- Dù Thành Phố Hỗn Loạn
-    1401408, -- Dù Đôi Cánh Cận Vệ
-    1401409, -- Dù Thiết Mã
-    1401410, -- Dù Bay Lướt Vũ Trụ
-    1401411, -- Dù C6 S18
-    1401412, -- Dù Nữ Đế Hắc Ám
-    1401413, -- Dù Hợp Tác Lamborghini
-    1401416, -- Dù Tượng Đá Cổ Xưa
-    1401417, -- Dù Đại Dương Xanh
-    1401418, -- KAKAO FRIENDS Parachute
-    1401419, -- Dù Infinix GT
-    1401420, -- Dù Esports World Cup 2024
-    1401421, -- Dù C7S19
-    1401422, -- Dù Thỏ Tinh Quái
-    1401423, -- Dù Hợp Tác VW
-    1401424, -- Dù Miêu Linh Sắc Màu
-    1401425, -- Dù Hắc Long Ma Nhãn
-    1401426, -- Dù Âm Dương
-    1401427, -- NieR:Automata Parachute
-    1401428, -- Dù Đam Mê Esports
-    1401429, -- Dù C7S20
-    1401430, -- Dù Venom: Kèo Cuối
-    1401431, -- Dù Bộ Tộc Ngân Hà
-    1401432, -- Dù Tuần Lộc Hoàng Gia
-    1401433, -- Dù McLaren
-    1401434, -- Dù PMGC 2024
-    1401435, -- Dù lượn Sói Tuyết
-    1401436, -- Dù lượn Bóng Nước
-    1401437, -- Dù lượn C7S21
-    1401438, -- Dù Cá Koi Xuân Sắc
-    1401439, -- Dù Đại Bàng
-    1401440, -- Dù Hoa Hồng Bóng Đêm
-    1401441, -- Opanchu Parachute
-    1401442, -- Neon Drop BE 6 Parachute
-    1401443, -- Dù C8S22
-    1401444, -- Dù Lượn Hắc Cốt
-    1401445, -- Dù Cực Quang Tinh Tú
-    1401446, -- Godzilla vs. Dù Destoroyah
-    1401447, -- Dù Thỏ Bồng Bềnh
-    1401448, -- Parachute(Frieren&Fern)
-    1401449, -- Dù C8S23
-    1401450, -- Dù Lượn Mã Số Hóa 
-    1401451, -- Dù Lượn Khuếch Đại Sắc Màu
-    1401452, -- Dù Hợp Tác Shelby
-    1401453, -- Dù Ráng Chiều Rực Cháy
-    1401454, -- Dù Attack on Titan
-    1401455, -- Dù Cơ Khí 
-    1401456, -- Mountain Dew Neon Shard Parachute
-    1401457, -- Dù C8S24
-    1401458, -- Dù Vũ Trụ
-    1401459, -- Dù Transformers
-    1401460, -- Dù Thần Mệnh
-    1401461, -- Dù Cún Yêu
-    1401462, -- Bbangbbang's diary Parachute
-    1401463, -- Realme Parachute
-    1401464, -- Dù Infinix GT
-    1401465, -- Dù C9S25
-    1401466, -- Dù Ác Quỷ
-    1401467, -- Dù Kaiju No. 8
-    1401468, -- Dù TEAM SONIC
-    1401469, -- Dù Hồ Điệp Lấp Lánh
-    1401470, -- Dù Lotus
-    1401471, -- Dù Bông Xù
-    1401472, -- Dù Gen Hoàn Hảo
-    1401473, -- Tokyo Revengers Parachute
-    1401474, -- Sky Striker Parachute
-    1401475, -- Dù C9S26
-    1401476, -- Dù Lượn Gấu Ngọt Ngào
-    1401477, -- Dù Balenciaga
-    1401478, -- Dù Lượn Tuyết Hàn
-    1401479, -- Dù Porsche
-    1401480, -- Dù Hắc Linh
-    1401481, -- Dù Chồn Chill
-    1401482, -- TV Anime DAN DA DAN Parachute
-    1401483, -- Dù C9S27
-    1401484, -- Dù Lượn Shuriken
-    1401485, -- Dù Bóng Ma Anh Quốc
-    1401486, -- Dù The King of Fighters
-    1401487, -- Dù Lượn Vũ Khúc
-    1401488, -- Dù Bảo Thạch
-    1401489, -- Dù Chuỗi Mùa Giải (2026H1)
-    1401490, -- Dù S28
-    1401491, -- Dù Trò Chơi Chúa Hề Lém Lĩnh
-    1401492, -- Dù Apollo
-    1401493, -- Dù Hacker Lạnh Lùng
-    1401494, -- Dù Hội Tụ Đa Chiều
-    1401495, -- Catch! Teenieping Parachute
-    1401496, -- SAKAMOTO TARO Parachute
-    1401497, -- Nakiri Ayame Parachute
-    1401498, -- Dù S29
-    1401499, -- Toxic Parachute
-    1401500, -- Dù Red (Tròn)
-    1401511, -- Dù Mèo Tinh Nghịch
-    1401513, -- Dù San Martin FC
-    1401515, -- Dù Mắt Quỷ
-    1401516, -- Dù Sóng Đêm
-    1401517, -- Dù Quả Quýt
-    1401519, -- Dù Gấu Ngáy Ngủ
-    1401520, -- Dù Hậu Duệ Đế Vương
-    1401521, -- Dù Mây Cuộn
-    1401526, -- Dù Hoa Văn Tráng Lệ
-    1401527, -- Dù Trái Tim Biển Cả
-    1401528, -- Dù Hành Tinh Mẹ
-    1401529, -- Dù Hoàng Tử Ánh Kim
-    1401530, -- Dù Giáp Gai
-    1401531, -- Dù Vùng Nguy Hiểm
-    1401532, -- Dù Ốc Biển
-    1401534, -- Dù Vịt Vàng B.Duck
-    1401538, -- Dù Thỏ Dịu Dàng
-    1401540, -- Dù Yeti
-    1401541, -- Dù Pixel Sắc Màu
-    1401542, -- Dù Mỹ Vị
-    1401543, -- Dù I Love Tao Kae Noi
-    1401544, -- Dù Vẹt Baby
-    1401545, -- Dù U.F.O
-    1401546, -- Dù Baby Shark
-    1401547, -- Dù Gấu Nhồi Bông
-    1401548, -- Dù Mèo Nghiêm Túc
-    1401549, -- Dù Vinh Quang Trường Tồn
-    1401551, -- Dù Nữ Vương Khôi Giáp
-    1401554, -- Dù Khủng Long Pixel
-    1401555, -- Dù Cánh Bướm Hoàng Gia
-    1401556, -- Dù Hành Trình Ngọt Ngào
-    1401610, -- Dù Chúc Mừng Sinh Nhật
-    1401611, -- Dù Sân Khấu Lấp Lánh
-    1401613, -- Dù Thẩm Phán Anubis
-    1401615, -- Dù Thần Horus
-    1401616, -- Dù One Plus
-    1401617, -- Dù Sư Tử Hống
-    1401618, -- Dù Facebook
-    1401619, -- Dù Bùa Hộ Mệnh Pharaoh
-    1401620, -- Dù Pharaoh (Xanh)
-    1401621, -- Dù Huyết Nha
-    1401622, -- Dù LINE FRIENDS
-    1401623, -- Dù PMNC 2021
-    1401624, -- Dù Poseidon
-    1401625, -- Dù Công Chúa Bộ Lạc
-    1401628, -- Dù Phượng Hoàng Adarna Ảo Diệu
-    1401629, -- Dù Thiếu Nữ Sáng Thế
-    1401811, -- Giannis Parachute
-    1401813, -- Dù Hành Trình Anh Hùng
-    1401814, -- Dù Rock 'n' Roll
-    1401815, -- Dù Chỉ Huy Chiến Trường
-    1401816, -- Dù BURGER KING
-    1401817, -- Dù Chiến Binh Huyết Ưng
-    1401820, -- Dù Cá Chuồn
-    1401822, -- Dù Quái Thú Đầm Lầy
-    1401823, -- Dù Lãnh Chúa Phong
-    1401824, -- Dù Hộp Quà
-    1401826, -- Dù - Mối Tình Đầu
-    1401827, -- Dù Nữ Hoàng Cà Phê
-    1401828, -- Dù Vệ Binh Cổ Đại
-    1401829, -- Dù Cơn Giận Của Thần
-    1401832, -- Dù C4S10
-    1401833, -- Dù Quái Thú Mê Cung
-    1401835, -- Dù Poker Đối Kháng
-    1401836, -- Dù Trò Chơi Chú Hề
-    1401837, -- Dù Huyễn Ảnh
-    1401838, -- Dù BLUE LOCK
-    1401839, -- Dù Ford
-    1401840, -- Dù Harley-Davidson®
-    1401841, -- Dù Hoa Hồng Cốt
-    1401842, -- Dù Song Tử
-    1401843, -- Dù Lượn Vòng Nguyệt Quế
-    1401844, -- Parachute(Pubniku)
-    1401845, -- Dù S30
-    1401846, -- Dù Sự Kiện Trial of Fire
-
-    -- [ TÀU LƯỢN / VÁN TRƯỢT / THIẾT BỊ BAY (Gliders/Hoverboards) ]
-    4151001, -- Dù (Xanh)
-    4151002, -- Hiệu ứng nhảy dù (Vàng)
-    4151003, -- Khói Lượn Dù (Hồng)
-    4151004, -- Khói lượn xanh
-    4151006, -- Khói lượn cầu vồng
-    4151010, -- Thiết bị bay Bằng Chíu
-    4151012, -- Ván Trượt Chu Kỳ
-    4151013, -- Ván Trượt Tuyết
-    4151014, -- Ván trượt CHU KỲ 2
-    4151015, -- Khói Lượn Dù Chúc Mừng (3 màu)
-    4151017, -- Ván trượt Trái Tim Rừng Xanh
-    4151018, -- Ván trượt Sinh Nhật
-    4151019, -- Tàu Lượn Chiến Thần Tình Yêu
-    4151020, -- Ván Trượt Cảnh Vệ C3
-    4151021, -- Tàu Lượn Sứ Giả Của Thần
-    4151022, -- Tàu Lượn Cánh Vàng
-    4151023, -- Ván Trượt Hợp Tác Messi
-    4151024, -- Tàu Lượn Giáo Sĩ Đỏ Thẫm
-    4151025, -- Tàu Lượn Diều Giấy
-    4151026, -- Ván Trượt Đại Sư Võ Hồn
-    4151027, -- Ván Trượt Cycle 4
-    4151028, -- Ván Trượt Giọt Lệ Huyết
-    4151029, -- Tàu Lượn Nữ Đế Ánh Sáng
-    4151030, -- Tàu Lượn Ma Vương Huyết Hồn
-    4151031, -- Tàu Lượn Khủng Long Túi Tiền
-    4151032, -- Tàu Lượn Cánh Rồng Đỏ Thẫm
-    4151034, -- Cân Đẩu Vân
-    4151035, -- Tàu Lượn Giao Hưởng Gió
-    4151036, -- Ván Trượt Máy Dập Sóng
-    4151037, -- Ván Trượt CYCLE 5
-    4151038, -- Dù Lượn Ngọc Trai Tuyệt Hảo
-    4151040, -- Ván trượt Thợ Săn Điện Quang
-    4151041, -- Dù Lượn Xương Xanh
-    4151042, -- Tàu Lượn Công Chúa Công Nghệ
-    4151043, -- Tàu Lượn Công Chúa Công Nghệ
-    4151044, -- Ván Trượt Cá Mập
-    4151045, -- Dù Lượn Mùa Đông Hoàng Gia
-    4151046, -- Ván Trượt Lưỡi Dao Trời Xanh
-    4151056, -- Dù Lượn Mùa Đông Hoàng Gia
-    4151057, -- Ván Trượt Hỏa Hồ Ly
-    4151058, -- Dù Lượn LINE FRIENDS
-    4151059, -- Ván Trượt Xuyên Mây
-    4151060, -- Dù Lượn Xà Kim
-    4151061, -- Ván Trượt CYCLE 6
-    4151062, -- Khói Lượn Dù Zanmang Loopy
-    4151063, -- SPY×FAMILY Tàu Lượn Bond
-    4151064, -- Dù Lượn Thiên Sứ
-    4151065, -- Dù Lượn Thiên Sứ
-    4151066, -- Dù Lượn Đế Vương Thần Vực
-    4151067, -- Dù Lượn Kính Vạn Hoa
-    4151068, -- Tàu Lượn Chúa Tể Gai Độc
-    4151069, -- Tàu Lượn Tinh Vân Sấm Sét
-    4151070, -- Tàu Lượn Kỵ Binh Thần Giáp
-    4151071, -- Dù Lượn Vệ Thần Tình Ái
-    4151072, -- Dù Lượn Ngao Du Vũ Trụ
-    4151073, -- Dù Lượn Neon Huyền Bí
-    4151074, -- PUBGM X NewJeans Glider
-    4151075, -- Dù Lượn Vệ Thần Tình Ái
-    4151076, -- Tàu Lượn Cửu Phong Thiên Tôn
-    4151077, -- Máy Bay
-    4151078, -- Tàu Lượn Hải Mã Sắt
-    4151079, -- Tàu Lượn Đôi Cánh Thế Giới Ngầm
-    4151080, -- Ván Trượt Cycle 7
-    4151083, -- Dù Lượn Long Cốt
-    4151084, -- Hồng Hỏa Diệm - Kar98 (Cấp 8)
-    4151085, -- Dù Lượn Cánh Thép Xuyên Không
-    4151086, -- DP Drift Parachute
-    4151087, -- Dù Lượn Long Cốt
-    4151089, -- Dù Lượn Hắc Điểu 
-    4151090, -- Dù Lượn Giấc Mộng Ngọt Ngào
-    4151091, -- Tàu Lượn Nhà Khám Phá Vũ Trụ
-    4151092, -- Dù Lượn Lam Sư Tinh Hà
-    4151093, -- Dù Lượn Ngọc Lang Thiên Giới
-    4151094, -- Ván Trượt CYCLE 8
-    4151095, -- Dù Lượn Đôi Cánh Anukhra
-    4151096, -- Dù Lượn Đôi Cánh Pharaoh
-    4151097, -- Tàu Lượn Siêu Thú Ghidorah
-    4151098, -- Dù Lượn Thời Quang Khả Biến
-    4151099, -- Dù Lượn Vương Quyền Hắc Ám
-    4151103, -- Dù Lượn Chiến Xa Tinh Tú
-    4151104, -- Tàu Lượn Thiết Bị ODM
-    4151105, -- Dù Lượn Định Mệnh Huyết Chú
-    4151106, -- Dù Lượn Quang Ảo Điện Từ 
-    4151107, -- Dù Lượn Chiến Xa Tinh Tú
-    4151108, -- Tàu Lượn Laserbreak
-    4151109, -- Tàu Lượn Băng Thần
-    4151110, -- Tàu Lượn Long Thánh
-    4151111, -- Tàu Lượn Thợ Săn Phản Lực
-    4151112, -- Tàu Lượn Tà Thần Mỹ Quang
-    4151113, -- Ván Trượt CYCLE 9
-    4151114, -- Tàu Lượn Long Thánh
-    4151115, -- Tàu Lượn Băng Thần
-    4151117, -- Tàu Lượn Preondactyl
-    4151118, -- Dù Lượn Hồ Điệp Lấp Lánh
-    4151119, -- Dù Lượn Chổi Phép Thuật
-    4151120, -- Dù Lượn Long Kính
-    4151121, -- Mikey Glider
-    4151122, -- Dù Lượn Hồ Điệp Lấp Lánh
-    4151123, -- Tàu Lượn Băng Linh Lưu Ly
-    4151124, -- Tàu Lượn Huyết Dực Tử Thần
-    4151125, -- Tàu Lượn Vệ Binh Ngân Hà
-    4151126, -- Tàu Lượn Giải Trí
-    4151127, -- Tàu Lượn Linh Mộc Vĩnh Cửu
-    4151128, -- Tàu Lượn Thần Quang
-    4151129, -- Ván Trượt Chuỗi Mùa Giải (2026H1)
-    4151130, -- Tàu Lượn Nue
-    4151131, -- Tàu Lượn Phượng Hoàng Đế Vương
-    4151132, -- Tàu Lượn Huyết Dực Hắc Điểu
-    4151133, -- Tàu Lượn Dịch Chuyển Không Gian
-    4151134, -- Dù Lượn Đa Vũ Trụ
-    4151135, -- SAKAMOTO TARO Glider
-    4151138, -- Tàu Lượn Sấm Sét Đỏ
-    4151139, -- Tàu Lượn Hư Không
-    4151140, -- Tàu Lượn Song Tử
-    4151141, -- Tàu Lượn Cerberus
-    4151142, -- Tàu Lượn Ngọc Trai
-    4151143, -- Tàu Lượn Song Tử
-    202408087,
-    202408061,
-    1102001001,
-    4152031, -- Tàu Lượn Ma Vương Huyết Hồn
-    4152035, -- Cân Đẩu Vân
-    4152036, -- Windborne Euphony Glider
-    4152037, -- Ván Trượt Máy Dập Sóng
-    4152038, -- Ván Trượt CYCLE 5
-    4152039, -- Tàu Lượn Ngọc Trai Tuyệt Hảo
-    4152041, -- Boxerbolt Hoverboard (Shop)
-    4152042, -- Blueyonder Glider
-    4152043, -- Agile Charmer Glider
-    4152044, -- Agile Charmer Glider
-    4152045, -- Chilly Perch Glider
-    4152046, -- Foxy Flare Hoverboard
-    4152058, -- LINE FRIENDS Glider (Shop)
-    4152059, -- Cloud Piercer Hoverboard (Shop)
-    4152060, -- Golden Wings Glider (Shop)
-    4152061, -- CYCLE 6 Skateboard (Shop)
-    4152063, -- Tàu Lượn Bond SPY×FAMILY (Cửa Hàng)
-    4152066, -- Dù Lượn Đế Vương Thần Vực (Cửa Hàng)
-    4152067, -- Tàu Lượn Kính Vạn Hoa (Cửa Hàng)
-    4152068, -- Tàu Lượn Chúa Tể Gai Độc (Cửa Hàng)
-    4152069, -- Tàu Lượn Tinh Vân Sấm Sét (Cửa Hàng)
-    4152070, -- Tàu Lượn Kỵ Binh Thần Giáp (Cửa Hàng)
-    4152076, -- Tàu Lượn Cửu Phong Thiên Tôn (Cửa Hàng)
-    4152077, -- Tàu Lượn (Cửa Hàng)
-    4152078, -- Tàu Lượn Hải Mã Sắt (Cửa Hàng)
-    4152079, -- Tàu Lượn Đôi Cánh Thế Giới Ngầm (Cửa Hàng)
-    4152080, -- Ván Trượt CYCLE 7 (Cửa Hàng)
-    4152092, -- Tàu Lượn Lam Sư Tinh Hà (Cửa Hàng)
-    4152093, -- Tàu Lượn Ngọc Lang Thiên Giới (Cửa Hàng)
-    4152094, -- Ván Trượt CYCLE 8 (Cửa Hàng)
-    4152095, -- Dù Lượn Đôi Cánh Anukhra
-    4152096, -- Dù Lượn Đôi Cánh Pharaoh
-    4152097, -- Tàu Lượn Siêu Thú Ghidorah
-    4152098, -- Dù Lượn Thời Quang Khả Biến
-    4152099, -- Dù Lượn Vương Quyền Hắc Ám
-    4152116, -- Tàu Lượn Long Thánh (Sảnh Một Người)
-
-    -- ==============================================================================
-    -- 3. TRANG PHỤC (OUTFITS), X-SUIT & PHỤ KIỆN
-    -- ==============================================================================
-    -- [ X-SUIT ]
-    1407895, -- X-Suit Quạ Huyết (7 Sao)
-    1407856, -- X-Suit Phượng Hoàng (7 Sao)
-    1405628, -- X-Suit Pharaoh Vàng (6 Sao)
-    1406469, -- X-Suit Pharaoh Vàng (7 Sao)
-    1405870, -- X-Suit Quạ Huyết (6 Sao)
-    1407140, -- X-Suit Poseidon (7 Sao)
-    1407142, -- X-Suit Silvanus (7 Sao)
-    1407141, -- X-Suit Bão Tuyết (7 Sao)
-    1407550, -- X-Suit Ánh Sáng Cầu Vồng (7 Sao)
-    1406638, -- X-Suit Hề Bí Ẩn (6 Sao) [Đen]
-    1406641, -- X-Suit Hề Bí Ẩn (6 Sao) [Trắng]
-    1406872, -- X-Suit Chúa Tể Âm Ty (7 Sao)
-    1406971, -- X-Suit Marmoris (7 Sao)
-    1407103, -- X-Suit Fiore (7 Sao)
-    1407219, -- X-Suit Ignis (7 Sao)
-    1407366, -- X-Suit Galadria (7 Sao)
-    1407512, -- X-Suit Anukhra (7 Sao)
-    1407625, -- X-Suit Dravion (7 Sao) [Nam]
-    1407667, -- X-Suit Dravion (7 Sao) [Nữ]
-
-    -- [ OUTFITS ]
-    1407870, -- Bộ Nữ Thần Không Gian
-    1407871, -- Bộ Thám Tử Đa Vũ Trụ
-    1407812, -- Bộ Vệ Binh Hoang Dã
-    1407758, -- Bộ Tiên Nữ Mùa Đông
-    1407286, -- Bộ Mèo Cyber Tinh Nghịch
-    1407329, -- Bộ Ánh Sáng Tĩnh Lặng
-    1407391, -- Bộ Nữ Bá Tước Ma Cà Rồng
-    1407392, -- Bộ Kẻ Phá Hoại Man Rợ
-    1407387, -- Bộ Tử Thần Tận Thế
-    1407440, -- Bộ Kẻ Chinh Phục Bắc Cực
-    1406985, -- Bộ Người Tình Bãi Biển
-    1407470, -- Bộ Thiên Thần Nổi Loạn
-    1407471, -- Bộ Cực Quang Nanh Ngọc
-    1407522, -- Bộ Hậu Duệ Tiên Cát
-    1407330, -- Bộ Đô Đốc Bóng Ma
-    1407523, -- Bộ Uy Quyền Tà Ác
-    1407558, -- Bộ Thái Dương Thăng Hoa
-    1407559, -- Bộ Ánh Sáng Nguyệt Cung
-    1407572, -- Bộ Huyết Dạ Hoàng Hôn
-    1407682, -- Bộ Kén Ẩn Sĩ
-    1407695, -- Bộ Lễ Tình Nhân Rùng Rợn
-    1407696, -- Bộ Lăng Kính Thăng Hoa
-    1407632, -- Bộ Hắc Dạ Tà Ác
-    1407573, -- Bộ Bóng Ma Điện Tử
-    1406398, -- Bộ Bóng Ma Rực Lửa
-    1406399, -- Bộ Kỵ Binh Oai Vệ
-    1406482, -- Bộ Chúa Tể Gai Góc
-    1406483, -- Bộ Tinh Vân Sấm Sét
-    1406555, -- Bộ Khuôn Mặt Địa Ngục
-    1406573, -- Bộ Thiên Nga Bóng Ma
-    1406574, -- Bộ Quan Tòa Vũ Trụ
-    1406656, -- Bộ Trưa Đẫm Máu
-    1406657, -- Bộ Đô Đốc Biển Sao
-    1406742, -- Bộ Đạo Sư Bạc
-    1406744, -- Bộ Hiệp Sĩ Thái Dương
-    1406789, -- Bộ Bóng Ma Địa Ngục
-    1406823, -- Bộ Giọt Nguyệt Bất Diệt
-    1406824, -- Bộ Kẻ Thù Nhuốm Máu
-    1406897, -- Bộ Ác Mộng Đỏ Thẫm
-    1407277, -- Trang Phục Hỏa Thần Cổ Ngữ
-    1406891, -- Trang Phục Linh Hồn Xác Ướp
-    1405623, -- Bộ Xác Ướp Vàng
-    1400687, -- Bộ Xác Ướp Trắng
-    1407618, -- Bộ Thực Hồn Bắc Cực (Polar Spectrophage)
-
-    -- [ Dragon Ball Super Collab ]
-    1406937, -- Trang Phục Nhân Vật Super Saiyan Son Goku
-    1406938, -- Trang Phục Nhân Vật Frieza
-    1406939, -- Trang Phục Nhân Vật Son Goku
-    1406947, -- Trang Phục Nhân Vật Vegeta
-    1406948, -- Trang Phục Nhân Vật Super Saiyan Vegeta
-    1406950, -- Trang Phục Beerus
-    1406951, -- Trang Phục Ma Bư
-    1406952, -- Trang Phục Quy Lão Kame
-    1406953, -- Trang Phục Nhân Vật Gohan Siêu Cấp
-    1406954, -- Trang Phục Nhân Vật Piccolo
-    1407264, -- Trang Phục Nhân Vật Vegito
-    1407265, -- Trang Phục Nhân Vật Vegito Siêu Saiyan
-    1407266, -- Trang Phục Nhân Vật Vegito Siêu Saiyan Xanh
-    1407267, -- Trang Phục Nhân Vật Son Goku Siêu Saiyan Xanh
-    1407268, -- Trang Phục Nhân Vật Son Goku Siêu Saiyan Xanh (Bị Thương)
-    1407269, -- Trang Phục Nhân Vật Vegeta Super Saiyan Xanh
-    1407270, -- Trang Phục Nhân Vật Vegeta Siêu Saiyan Xanh (Bị Thương)
-    1407271, -- Trang Phục Nhân Vật Bulma
-
-    -- [ Evangelion Collab ]
-    1406385, -- Plugsuit Evangelion Shinji
-    1406386, -- Plugsuit Evangelion Rei
-    1406387, -- Plugsuit Evangelion Asuka
-    1406388, -- Plugsuit Evangelion Mari
-    1406389, -- Plugsuit Evangelion Kaworu
-
-    -- [ Attack on Titan Collab ]
-    1407563, -- Trang Phục Nhân Vật Eren Jaeger
-    1407565, -- Trang Phục Nhân Vật Mikasa Ackermann
-    1407566, -- Trang Phục Nhân Vật Armin Arlelt
-    1407567, -- Trang Phục Titan Khổng Lồ (Armin)
-    1407568, -- Trang Phục Nhân Vật Levi
-    1407569, -- Trang Phục Titan Bọc Thép
-
-    -- [ Kaiju No. 8 Collab ]
-    1407672, -- Trang Phục Nhân Vật Kafka Hibino
-    1407673, -- Trang Phục Kaiju No. 8
-    1407674, -- Trang Phục Nhân Vật Kikoru Shinomiya
-    1407675, -- Trang Phục Kaiju No. 9
-    1407676, -- Trang Phục Kaiju No. 10
-    1407677, -- Trang Phục Nhân Vật Mina Ashiro
-    1407678, -- Trang Phục Nhân Vật Reno Ichikawa
-    1407679, -- Trang Phục Nhân Vật Soshiro Hoshina
-
-    -- [ BlackPink & Kpop Collabs ]
-    1406132, -- Trang phục DDU-DU DDU-DU ROSÉ
-    1406133, -- Trang phục DDU-DU DDU-DU JENNIE
-    1406134, -- Trang phục DDU-DU DDU-DU JISOO
-    1406135, -- Trang phục DDU-DU DDU-DU LISA
-    1406161, -- Trang phục How You Like That ROSÉ
-    1406162, -- Trang phục How You Like That JENNIE
-    1406163, -- Trang phục How You Like That JISOO 
-    1406164, -- Trang phục How You Like That LISA
-    1406178, -- Trang phục Lovesick Girls ROSÉ
-    1406179, -- Trang phục Lovesick Girls JENNIE
-    1406180, -- Trang phục Lovesick Girls JISOO
-    1406181, -- Trang phục Lovesick Girls LISA
-    1407346, -- PUBGM X NewJeans MINJI Set
-    1407347, -- PUBGM X NewJeans HANNI Set
-    1407348, -- PUBGM X NewJeans HAERIN Set
-    1407349, -- PUBGM X NewJeans DANIELLE Set
-    1407350, -- PUBGM X NewJeans HYEIN Set
-    1407745, -- Trang Phục RAMI (Babymonster)
-    1407746, -- Trang Phục ASA (Babymonster)
-    1407747, -- Trang Phục AHYEON (Babymonster)
-    1407748, -- Trang Phục RORA (Babymonster)
-    1407749, -- Trang Phục CHIQUITA (Babymonster)
-    1407750, -- Trang Phục PHARITA (Babymonster)
-    1407751, -- Trang Phục RUKA (Babymonster)
-    1407826, -- Trang Phục PUBG MOBILE × aespa KARINA
-    1407827, -- Trang Phục PUBG MOBILE × aespa GISELLE
-    1407828, -- Trang Phục PUBG MOBILE × aespa WINTER
-    1407829, -- Trang Phục PUBG MOBILE × aespa NINGNING
-    1407687, -- Trang Phục G-DRAGON PEACEMINUSONE
-    1407688, -- Trang Phục Sân Khấu của G-DRAGON
-
-    -- [ CÁC COLLAB NỔI BẬT KHÁC (Messi, Lý Tiểu Long, SPYxFAMILY...) ]
-    1406648, -- Trang Phục Biểu Tượng Bóng Đá Messi
-    1406649, -- Trang Phục Huyền Thoại Siêu Sao Messi
-    1406728, -- Trang Phục Kung Fu Lý Tiểu Long
-    1406729, -- Trang Phục Chuyên Gia Cận Chiến Lý Tiểu Long
-    1406730, -- Trang Phục Rồng Gầm Lý Tiểu Long
-    1406731, -- Trang Phục Võ Sĩ Lý Tiểu Long
-    1407206, -- SPY×FAMILY Trang Phục Hoàng Hôn
-    1407401, -- C.C. Set
-    1407402, -- Kallen Kozuki Set
-    1407404, -- Suzaku Kururugi Set
-    1407405, -- ZERO Set
-    1407408, -- Emperor Lelouch Set
-    1407769, -- Okarun(transformed) Set
-    1407770, -- Okarun Set
-    1407771, -- Momo Set
-    1407772, -- Jiji(transformed) Set
-    1407773, -- Aira Set
-    1407794, -- Trang Phục Nhân Vật John Shelby
-    1407795, -- Trang Phục Nhân Vật Arthur Shelby
-    1407796, -- Trang phục Thomas Shelby
-    1407798, -- Trang Phục Nhân Vật Iori Yagami
-    1407800, -- Trang Phục Nhân Vật Mai Shiranui
-    1407801, -- Trang Phục Nhân Vật Nakoruru
-    1407846, -- Trang Phục Nhân Vật Kimono Ryomen Sukuna
-    1407848, -- Trang Phục Nhân Vật Suguru Geto
-    1407901, -- Trang Phục Nhân Vật Isagi Yoichi
-    1407902, -- Trang Phục Nhân Vật Bachira Meguru
-
-    -- [ Set Đồ Đỏ Tự Nhiên & Siêu VIP của Game ]
-    1405160, -- Huyền Thoại Godzilla
-    1405161, -- Siêu Thú Ghidorah
-    1405186, -- Bộ Đồ Godzilla
-    1405662, -- Trang phục Giáp Samurai
-    1405663, -- Trang phục Sát Thủ Bóng Đêm
-    1406020, -- Trang phục Quái Thú
-    1406398, -- Trang phục Hỏa Diệm Ma Giáp
-    1406399, -- Trang phục Kỵ Binh Thần Giáp
-    1406456, -- Trang Phục Anh Hùng Truyền Thuyết
-    1406568, -- Trang Phục Nữ Hoàng Bóng Đêm
-    1406569, -- Trang Phục Minh Vương Hành Quyết
-    1406732, -- Trang Phục Nữ Đế Hoàng Kim
-    1406733, -- Trang Phục Hoàng Đế Hoàng Kim
-    1406764, -- Trang Phục Thiếu Nữ Đỏ Rực
-
-    -- ==============================================================================
-    -- 4. ÁO, QUẦN, GIÀY ĐẸP & TDM (PHONG CÁCH CỰC CHẤT)
-    -- ==============================================================================
-    -- [ BAPE & ALAN WALKER ]
-    1400569, -- BAPE MIX CAMO HOODIE
-    1400650, -- BAPE MIX CAMO SHORTS
-    1400651, -- BAPE STA MID
-    1404000, -- BAPE City Camo Hoodie
-    1404002, -- BAPE City Camo Pants
-    1404003, -- BAPE Sta Mid
-    1404048, -- Áo BAPE X PUBGM CAMO
-    1404049, -- Áo Hoodie cá mập BAPE X PUBGM CAMO
-    1404050, -- Quần BAPE X PUBGM CAMO
-    1404051, -- Giày BAPE X PUBGM CAMO
-    1404016, -- Alan Walker T-shirt
-    1404017, -- Alan Walker Hoodie
-    1404042, -- Trang phục Alan Walker
-    1404043, -- Áo Alan Walker
-    1404044, -- Quần Alan Walker
-    1404045, -- Giày Alan Walker
-    1404340, -- Trang phục Alan Walker 2021
-    1403038, -- Alan Walker Mask
-    1403064, -- Khẩu trang Alan Walker
-
-    -- [ Đồ TDM Phổ Biến (Khăn bịt mặt, Áo Lính, Áo Khoác Đen...) ]
-    402001, -- Khăn rằn sinh tồn
-    402037, -- Khăn quàng cao bồi
-    402043, -- Khăn quàng PUBG (Đỏ-Đen)
-    402045, -- Khăn quàng PUBG (Chiến thuật)
-    1400158, -- Mặt Nạ Hockey
-    1402005, -- Mysterious Leather Mask
-    1403100, -- Mặt nạ người leo núi
-    403010, -- Áo Ba Lỗ Bẩn (Trắng)
-    403028, -- Áo Trench coat (Màu đen)
-    403181, -- Áo lính sa mạc
-    403182, -- Áo Hoodie săn mồi (Đen)
-    403183, -- Áo Hoodie biệt kích (Trắng)
-    403192, -- Áo khoác bomber
-    404006, -- Quần Jeans (Nâu)
-    404008, -- Quần lính (Ka-ki)
-    404013, -- Quần lính (Rằn ri)
-    404015, -- Quần Jeans Bó (Màu Lam)
-    404026, -- Quần túi hộp (Màu be)
-    404028, -- Quần túi hộp (Màu đen)
-    404084, -- Quần thể thao ngắn (Đen)
-    404100, -- Quần người ẩn nấp (Đen)
-    405001, -- Giày đế mềm (Màu trắng)
-    405002, -- Giày thể thao cổ cao
-    405019, -- Giày lính chim ưng (Đen)
-    405044, -- Giày đế mềm (Đen)
-    1400013, -- Quần Jeans Mỹ
-
-    -- [ CÁC ÁO LẺ VIP (Collab, Siêu Xe) ]
-    1404142, -- Áo thun THE WALKING DEAD (Trắng)
-    1404143, -- Áo thun THE WALKING DEAD (Đen)
-    1404218, -- Áo Hoodie COVERNAT (Trắng)
-    1404219, -- Áo Hoodie COVERNAT (Đen)
-    1404326, -- Áo thun Xiaomi
-    1404327, -- Áo thun OnePlus
-    1404405, -- Áo Đấu Hợp Tác Messi × PUBG MOBILE
-    1404406, -- Áo Thun Lý Tiểu Long
-    1404411, -- Hoodie Ducati
-    1404412, -- Giày Ducati Corse City C2
-    1404413, -- Quần Ducati Sport C2
-    1404414, -- Áo Khoác Ducati Speed Evo C2
-    1404426, -- Áo PMGC 2023
-    1404427, -- Quần Người Chinh Phục Pagani
-    1404428, -- Giày Người Chinh Phục Pagani
-    1404508, -- Áo Hoodie Mr.Beast
-    1400324, -- áo b
-    1400325, -- áo a
-    452001, 452002, 452003, -- Găng Tay (Gloves)
-    
-        -- [ HÀNH ĐỘNG ]
-    12201301, -- Hành động Sát thủ Gothic
-    12216101, -- Hành động Võ sĩ Huyết Ưng
-    12212201, -- Hành động Sát thủ Cực Ám
-    12219207, -- Hành động Đại tướng Thiên Ngưu
-    12209001, -- Hành động Võ sĩ (Samurai)
-    12219561, -- Hành động Áo choàng Đỏ thẫm
-    12210001, -- Hành động Cái chạm của Tử thần
-    12219022, -- Hành động Thiết vệ Gai góc
-    12208801, -- Hành động Dũng sĩ Bán thần
-    12210801, -- Hành động Thợ săn Vỏ bạc
-    12200701, -- Hành động Du hành Không thời gian
-    12219242, -- Hành động Dạo bước Bầu trời
-    12206001, -- Hành động Hoa linh Đồng xanh
-    12205401, -- Hành động Vua của muôn thú
-    12205201, -- Hành động Trái tim Cự thú
-    12212601, -- Hành động Sát lục Thần bí
-    12205601, -- Hành động Linh hồn Cự thú
-    12219208, -- Hành động Hầu vương Cyber
-    12212001, -- Hành động Võ thánh
-    12206801, -- Hành động Hải long Thần bí
-    12209801, -- Hành động Ngự linh sư
-    12211401, -- Hành động Nữ phù thủy Băng tuyết
-    12207001, -- Hành động Du hành Biển sao
-    12211801, -- Hành động Chúa tể Trật tự
-    12207901, -- Hành động Hải vương Quyến rũ
-    12203401, -- Hành động Kỷ niệm Ảo ảnh
-    12204001, -- Hành động Chú hề (Ngày Cá tháng Tư)
-    12201801, -- Hành động Người bảo vệ Vùng tuyết
-    12215601, -- Hành động Siêu nhân Hằng tinh
-    12215532, -- Hành động Lãnh chúa Ngọn lửa
-    12213201, -- Hành động Kế hoạch Ngày mai
-    12215529, -- Hành động Kỵ sĩ Đua xe
-    12219053, -- Hành động Nữ hoàng Trân bảo
-    12204601, -- Hành động Thiên hạ Bố võ
-    12215701, -- Hành động Hành tinh Vượn người
-    12219003, -- Hành động Bóng tối Thần linh
-    12219004, -- Hành động Ngân hồn Rực lửa
-    12219009, -- Hành động Mê hoặc Rực lửa
-    12219216, -- Hành động Tế tư Héo úa
-    
-    
-    -- tóc mặt tùm lum
-    1404198, 1410085, 1404366, 1403137, 1410480, 1403028, 1400158, 40605011, 1404323, 1406001, 1403002,
-
--- ==============================================================================
-    -- MŨ GIÁP VIP (CHỈ LẤY CẤP 1 - GỌN GÀNG, DỄ ẨN NẤP)
-    -- ==============================================================================
-    1502001183, -- Godzilla Helmet (Lv. 1)
-    1502001194, -- Mũ MECHAGODZILLA (Cấp 1)
-    1502001093, -- Mũ Thẩm Phán Anubis (Cấp 1) - Pharaoh
-    1502001305, -- Mũ Giáp Siêu Nhân Thép (Cấp 1)
-    1502001320, -- Mũ Giáp Biểu Tượng Bóng Đá Messi (Cấp 1)
-    1502001105, -- Mũ Tàng Hình (Cấp 1)
-    1502001364, -- Mũ Giáp PMGC 2023 (Cấp 1)
-    1502001373, -- Mũ Giáp LINE FRIENDS BROWN (Cấp 1)
-    1502001402, -- APEACH Helmet (LV.1)
-    1502001403, -- Bellygom Helmet (LV.1)
-    1502001427, -- Opanchu Helmet (Lv.1)
-    1502001443, -- Mũ Giáp Sóng Âm Cuồng Loạn (Cấp 1)
-    1502001450, -- Mũ Giáp Cún Tinh Nghịch (Cấp 1)
-    1502001471, -- Turbo Granny (Beckoning cat) Helmet (Lv. 1)
-    1502001480, -- Mũ Giáp PUBG MOBILE × aespa (Cấp 1)
-    1502001490, -- Nakiri Ayame Helmet (Lv.1)
-    1502001495, -- Mũ BLUE LOCK (Cấp 1)
-    1502001001, -- Mũ pizza nóng (Cấp 1)
-    1502001004, -- Mũ Cyberpunk (Tím) (Cấp 1)
-    1502001005, -- Mũ hộp sọ (Cấp 1)
-    1502001046, -- Mũ Samurai - danh dự (Cấp 1)
-    1502001058, -- Mũ bảo hiểm Monarch (Cấp 1)
-    1502001064, -- Mũ bảo hiểm Thiên Sứ (Cấp 1)
-    1502001073, -- Mũ Vệ Binh Robot (Cấp 1)
-    1502001078, -- Mũ Ninja Sát Thủ (Cấp 1)
-    1502001086, -- Mũ Chuột Tinh Nghịch (Cấp 1)
-    1502001099, -- Mũ Corgi (Cấp 1)
-    1502001115, -- Mũ Bọ Rùa (Cấp 1)
-    1502001133, -- Mũ Bí Ngô Kinh Dị (Cấp 1)
-    1502001145, -- Mũ Chú Lính Chì (Cấp 1)
-    1502001154, -- Mũ Giáp Đại Bàng Tỏa Sáng (Cấp 1)
-    1502001175, -- Mũ Vịt Vàng B.Duck (Cấp 1)
-    1502001230, -- Mũ Rồng Công Nghệ (Cấp 1)
-    1502001248, -- Mũ Người Mở Đường (Cấp 1)
-    1502001264, -- Mũ Ét Ô Ét (Cấp 1)
-    1502001276, -- Mũ Vũ Công Bí Ẩn (Cấp 1)
-    1502001294, -- Mũ Giáp Ma Pháp Sư (Cấp 1)
-    1502001301, -- Mũ Giáp Archon Lừng Lẫy (Cấp 1)
-    1502001357, -- Mũ Giáp Son Goku (Cấp 1)
-    1502001381, -- Mũ Giáp Hỏa Linh Chí Tôn (Cấp 1)
-    1502001416, -- Mũ Giáp PMGC 2024 (Cấp 1)
-    1502001453, -- 2025 Esports Helmet (Lv. 1)
-
-    -- ==============================================================================
-    -- BA LÔ VIP (CHỈ LẤY CẤP 1 - GỌN GÀNG, DỄ ẨN NẤP)
-    -- ==============================================================================
-    1501001174, -- Ba lô Pharaoh (Cấp 1)
-    1501002174,
-    1501003174,
-    1501001045,
-    1501002045,
-    1501003045,
-    
-    
-    
-    
-    
-    
-    1501001220, -- Ba lô Huyết Nha (Cấp 1)
-    1501001265, -- Ba lô Poseidon (Cấp 1)
-    1501001548, -- Balo Thần Thoại Viễn Cổ (Cấp 1)
-    1501001559, -- Balo Thanh Hoa Xà (Cấp 1)
-    1501001567, -- Ba Lô Hỏa Linh Chí Tôn (Cấp 1)
-    1501001577, -- Balo Đôi Cánh Vệ Thần (Cấp 1)
-    1501001607, -- Balo Dơi Bóng Đêm (Cấp 1)
-    1501001061, -- Ba lô Godzilla (Cấp 1)
-    1501001062, -- Ba Lô Siêu Thú Ghidorah (Cấp 1)
-    1501001082, -- Ba lô Genbu (Cấp 1)
-    1501001112, -- Ba lô Pig Ngốc Nghếch (Cấp 1)
-    1501001133, -- Ba lô Joker Khát Máu (Cấp 1)
-    1501001243, -- Ba Lô Vịt Vàng B.Duck (Cấp 1)
-    1501001273, -- Ba lô MECHAGODZILLA (Cấp 1)
-    1501001304, -- Ba lô Ma Vương (Cấp 1)
-    1501001331, -- Ba lô của Jinx (Cấp 1)
-    1501001340, -- Ba Lô Hải Cẩu Tuyết (Cấp 1)
-    1501001376, -- Ba lô Máy Hát Cổ Điển (Cấp 1)
-    1501001400, -- Ba lô Baby Shark (Cấp 1)
-    1501001463, -- Ba Lô BoBoiBoy (Cấp 1)
-    1501001476, -- Ba Lô Biểu Tượng Bóng Đá Messi (Cấp 1)
-    1501001480, -- Ba Lô Mì Indomie (Cấp 1)
-    1501001487, -- Ba Lô Con Mắt Chết Chóc (Cấp 1)
-    1501001521, -- Ba Lô Quy Lão Kame (Cấp 1)
-    1501001539, -- Ba Lô PMGC 2023 (Cấp 1)
-    1501001540, -- Ba Lô Gà Rán KFC (Cấp 1)
-    1501001554, -- Ba Lô LINE FRIENDS SALLY (Cấp 1)
-    1501001587, -- Ba Lô Đại Úy Loạn Thế (Cấp 1)
-    1501001597, -- Bellygom Backpack (LV.1)
-    1501001632, -- Opanchu Backpack (Lv.1)
-    1501001643, -- Frieren&Mimic Backbag (Lv.1)
-    1501001650, -- Ba Lô Titan Khổng Lồ Cấp 1
-    1501001683, -- Ba Lô Balenciaga (Cấp 1)
-    1501001715, -- SAKAMOTO TARO Backpack (Lv.1)
-    1501001720, -- Ba Lô BLUE LOCK (Cấp 1)
-    
-        -- [ BALO, MŨ & DÙ LƯỢN ]
-    1501001024, -- Balo Bá Tước
-    1501002024,
-    1501003024,
-    1501001742,
-    1501002742,
-    1501003742,
-    1501001058,
-    1501002058,
-    1501003058,
-    1501001726,
-    1501002726,
-    1501003726,
-    1501001287,
-    1501002287,
-    1501003287,
-    1501001640,
-    1501002640,
-    1501003640,
-    1501001688,
-    1501002688,
-    1501003688,
-    1501003051,
-    1501002051,
-    1501001051,
-    1502001014, -- Mũ Đinh
-    1502002014,
-    1502003014,
-    1502001439, -- mũ vương miện
-    1502002439,
-    1502003439,
-    1502002069,
-    1502001069, -- mũ cương thi
-    1502003069,
-    1502001031,
-    1502002031,
-    1502003031,
-    1502001363,
-    1502002363,
-    1502003363,
-    1502001023, -- mũ băng
-
-    -- id bổ xung
-    1400092, 1400101, 1400122, --tư lệnh
-    1404191, -- quần bộ hành
-    1405128, 1405129, 140224445, 140224445, -- crew
-    1407961, 1407962, 1407963, 19080660, 1407964, 1407965, 1407966, 1407967, 1407968, 1407969, 1407970, 1407971, 1502001508, 1502002508, 1502003508, 1411134, 1411133, 1411135, 1403771, 1403770, 1407994, 1407993, 1101006106, 1101006098, 4151145, 1903230, 1903231, 1903232, 1908117, 1953011, 1953021,1953012, 1908118, 1908119, 19116002, 19116003, 19116004, 1961070, 1961071, 1961072, 1961073, 1408045, 1408038, 1407990,1407922, -- Trang Phục Nữ Thần Ái Tình
-    1407704, -- Trang Phục Cô Dâu Tinh Quái
-    1400782, -- Trang phục băng tuyết
-    1407614, -- Trang Phục Optimus Prime Transformers
-    1407276, -- Trang Phục Vệ Thần Tình Ái
-    1410356, -- Mặt Nạ Ma Vương Huyết Hồn
-    40605012, -- Tóc Hai Chùm
-    401035, -- Mũ cao bồi (Trắng)
-    1916004, --Tesla Cybertruck (Splendid-Silver)
-   1916005, --Tesla Cybertruck (Dystopia Blue)
-   1916006, --Tesla Cybertruck (Black-Quartz)
-}
-
-local INS_BASE = 2000000000
-local PKG_SLOT = 3
-local MELEE_ID = 108
-local HAT_SUB = 401
-local MASK_SUB = 402
-local OUTFIT_SUB = 403
-local PANTS_SUB = 404
-local SHOES_SUB = 405
-local GLASS_SUB = 407
-local GLIDER_SUB = 415      
-local GLOVES_SUB = 452
-local GLIDER_SUBS = { [413] = true, [414] = true, [415] = true }
-
-F.CUST_SLOT = {
-    NONE = 0,
-    HeadEquipemtSlot = 1,
-    HairEquipemtSlot = 2,
-    HatEquipemtSlot = 3,
-    FaceEquipemtSlot = 4,
-    ClothesEquipemtSlot = 5,
-    PantsEquipemtSlot = 6,
-    ShoesEquipemtSlot = 7,
-    BackpackEquipemtSlot = 8,
-    HelmetEquipemtSlot = 9,
-    ArmorEquipemtSlot = 10,
-    ParachuteEquipemtSlot = 11,
-    GlassEquipemtSlot = 12,
-    NightVisionEquipemtSlot = 13,
-    BeardEquipemtSlot = 14,
-    GlideEquipemtSlot = 15,
-    HandEffectEquipemtSlot = 16,
-    BackPack_PendantSlot = 17,
-}
-_G.CustSlotType = F.CUST_SLOT
-
-local CHASSIS_LIGHT_SUB = 7302
-local CHASSIS_LIGHT_IDS = { [7302001] = true, [7302002] = true }
-local DEFAULT_CHASSIS_LIGHT = 7302002
-local PARACHUTE_SUB = 701   
-local DEFAULT_PARACHUTE_RES = 703001  
-local TAB_SUIT = 10
-local TAB_CLOTHES = 3
-local PAGE_AVATAR = 1
-local PAGE_VEHICLE = 6
-local PAGE_PARACHUTE = 5
-local HALL_THEME_TYPE = 202
-local SUBTYPE_DEFAULT_TAB = {
-    [401] = 1, [402] = 2, [403] = 10, [404] = 4, [405] = 5, [407] = 14,
-    [501] = 15, [504] = 15, [502] = 16, [505] = 16,
-}
-local HAT_SUBS = { [401] = true }
-local HELMET_SUBS = { [502] = true, [505] = true }
-local HEAD_SUBS = { [401] = true } -- [FIX VIP] Đã xóa 502 và 505 để tách biệt hoàn toàn Mũ Bảo Hiểm khỏi Tóc/Mũ Thời Trang
-local BAG_SUBS = { [501] = true, [504] = true }
-local FACE_SUBS = { [402] = true, [407] = true }
-local BODY_SUBS = { [404] = true, [405] = true, [501] = true, [504] = true, [502] = true, [505] = true }
-local GUN_SUB = { [101]=true, [102]=true, [103]=true, [104]=true, [105]=true, [106]=true, [107]=true }
-local NET_OK = NetErrorCode_NONE or "ok"
-
-local R = { insToRes = {}, resToIns = {}, byWeapon = {} }
-local _matchApplied = false
-
+return originalExport
