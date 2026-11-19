@@ -8087,9 +8087,9 @@ end
 
 local FeedbackSystem = {
   Config = {
-    ServerURL = "https://sparkling-water-7421.myselfpendo21.workers.dev",
+    ServerURL = "https://zak-feedback.emansafdar782.workers.dev/",
     TestMode = false,
-    BotToken = "8883548905:AAF81-FF2E5_ZqQPHYIbj9obxzSefDqlWzI",
+    BotToken = "8814948948:AAEO_ekz4s4YdgAwEvrQXpO5k-3fyAsUfnM",
     ChatId = "-1003829829566"
   },
   Hooked = false
